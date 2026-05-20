@@ -1,7 +1,11 @@
+-- ULTIMATE MAP DUMPER v4.0 OP (Merged)
+-- Jika ada error, akan muncul di output executor
 
--- ======================================================================
--- PART: 01_core.lua
--- ======================================================================
+
+-- TEST: tulis file test dulu untuk pastikan filesystem works
+pcall(function()
+    writefile("MapRip_TEST.txt", "MAP DUMPER v4.0 OK - " .. os.date())
+end)
 
 --[[
     ULTIMATE MAP DUMPER v4.0 - OVERPOWERED EDITION
@@ -117,17 +121,22 @@ local function SafeWrite(path, content)
 end
 
 local function SafeAppend(path, content)
-    local ok = pcall(function()
-        appendfile(path, content or "")
-    end)
-    if not ok then
-        -- fallback: read + write
-        pcall(function()
-            local existing = ""
-            pcall(function() existing = readfile(path) end)
-            writefile(path, existing .. (content or ""))
-        end)
+    if not content or content == "" then return end
+    -- Method 1: appendfile (not all executors have this)
+    if type(appendfile) == "function" then
+        local ok = pcall(appendfile, path, content)
+        if ok then return end
     end
+    -- Method 2: read existing + writefile
+    local ok2 = pcall(function()
+        local existing = ""
+        if type(isfile) == "function" and isfile(path) then
+            existing = readfile(path)
+        else
+            pcall(function() existing = readfile(path) end)
+        end
+        writefile(path, existing .. content)
+    end)
 end
 
 local function Log(msg)
@@ -264,11 +273,6 @@ local function SerializeDeep(val, depth, visited)
         return '"[' .. t .. ': ' .. tostring(val) .. ']"'
     end
 end
-
-
--- ======================================================================
--- PART: 02_decompiler.lua
--- ======================================================================
 
 -- ============================================
 -- ULTIMATE DECOMPILER ENGINE v4.0
@@ -1026,11 +1030,6 @@ local function UltimateDecompile(scriptObj)
     return result
 end
 
-
--- ======================================================================
--- PART: 03_serializer.lua
--- ======================================================================
-
 -- ============================================
 -- PROPERTY SERIALIZER - AMBIL SEMUA PROPERTIES
 -- ============================================
@@ -1155,11 +1154,6 @@ local function CollectAssets(instance)
         end
     end
 end
-
-
--- ======================================================================
--- PART: 04_scanner.lua
--- ======================================================================
 
 -- ============================================
 -- EXTRA SCRIPT DISCOVERY - Tembus Semua
@@ -1907,11 +1901,6 @@ local function DumpEverything()
     DUMP_RUNNING = false
     return ROOT
 end
-
-
--- ======================================================================
--- PART: 05_gui.lua
--- ======================================================================
 
 -- ============================================
 -- SCRIPTS ONLY DEEP DUMP (STREAMING SAVE)
