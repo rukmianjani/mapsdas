@@ -326,10 +326,10 @@ local function renderLogs()
         if c:IsA("TextLabel") then c:Destroy() end
     end
     
-    -- Render (max 100 visible)
+    -- Render (max 50 visible to prevent lag)
     local shown = 0
     for _, entry in ipairs(logs) do
-        if shown >= 100 then break end
+        if shown >= 50 then break end
         if filterText == "" or entry.full:lower():find(filterText, 1, true) then
             shown = shown + 1
             local lbl = Instance.new("TextLabel")
@@ -350,114 +350,101 @@ local function renderLogs()
     StatsBar.Text = string.format("Logs: %d | Shown: %d | %s", #logs, shown, capturing and "CAPTURING" or "PAUSED")
 end
 
--- Render loop
+-- Render loop (less aggressive - only update every 1.5s)
 task.spawn(function()
     while Gui.Parent do
         renderLogs()
-        task.wait(0.5)
+        task.wait(1.5)
     end
 end)
 
 -- ═══════════════════════════════════════
--- HOOKS: Capture all network traffic
+-- HOOKS: Capture network (SAFE - no hookmetamethod)
+-- Delta executor compatible - NO freeze/disconnect
 -- ═══════════════════════════════════════
 
--- Hook 1: __namecall (captures FireServer, InvokeServer)
+--[[
+    STRATEGY: Passive listening only
+    - S→C: Connect to .OnClientEvent (100% safe, no hook needed)
+    - C→S: We DON'T hook __namecall (it breaks Delta networking)
+           Instead we wrap specific remotes with a proxy logger
+]]
+
+-- Hook S→C: Listen to all remotes in Network folder (SAFE)
 pcall(function()
-    local oldNamecall
-    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        local args = {...}
-        
-        if capturing then
-            if method == "FireServer" and self:IsA("RemoteEvent") then
-                addLog("C→S", self.Name .. " [" .. self.Parent.Name .. "]", serializeArgs(unpack(args)))
-            elseif method == "InvokeServer" and self:IsA("RemoteFunction") then
-                addLog("INVOKE", self.Name .. " [" .. self.Parent.Name .. "]", serializeArgs(unpack(args)))
+    if NetworkFolder then
+        for _, child in pairs(NetworkFolder:GetChildren()) do
+            if child:IsA("RemoteEvent") then
+                child.OnClientEvent:Connect(function(...)
+                    if not capturing then return end
+                    local args = {...}
+                    task.defer(function()
+                        local dir = child.Name:find("^rev_") and "S→C" or "S→C?"
+                        addLog(dir, child.Name, serializeArgs(unpack(args)))
+                    end)
+                end)
+            elseif child:IsA("UnreliableRemoteEvent") then
+                child.OnClientEvent:Connect(function(...)
+                    if not capturing then return end
+                    local args = {...}
+                    task.defer(function()
+                        addLog("S→C", "[U]" .. child.Name, serializeArgs(unpack(args)))
+                    end)
+                end)
             end
         end
-        
-        return oldNamecall(self, ...)
-    end)
+    end
 end)
 
--- Hook 2: Listen to ALL OnClientEvent (server → client)
+-- Hook C→S: Wrap FireServer on known remotes (SAFE alternative to hookmetamethod)
 pcall(function()
-    local function hookRemote(remote)
-        if remote:IsA("RemoteEvent") then
-            remote.OnClientEvent:Connect(function(...)
-                if capturing then
-                    addLog("S→C", remote.Name .. " [" .. remote.Parent.Name .. "]", serializeArgs(...))
-                end
-            end)
+    if NetworkFolder then
+        for _, child in pairs(NetworkFolder:GetChildren()) do
+            if child:IsA("RemoteEvent") and not child.Name:find("^rev_") then
+                -- Wrap the remote's FireServer via newcclosure
+                local origFire = child.FireServer
+                child.FireServer = newcclosure and newcclosure(function(self, ...)
+                    if capturing then
+                        local args = {...}
+                        task.defer(function()
+                            addLog("C→S", child.Name, serializeArgs(unpack(args)))
+                        end)
+                    end
+                    return origFire(self, ...)
+                end) or origFire -- fallback if newcclosure not available
+            end
         end
     end
-    
-    -- Hook existing remotes
-    for _, obj in pairs(RS:GetDescendants()) do
-        pcall(function() hookRemote(obj) end)
-    end
-    
-    -- Hook future remotes
-    RS.DescendantAdded:Connect(function(obj)
-        task.wait(0.1)
-        pcall(function() hookRemote(obj) end)
-    end)
 end)
 
--- Hook 3: firetouchinterest (if available)
+-- Hook firetouchinterest (SAFE - just wraps function)
 pcall(function()
     if firetouchinterest then
         local oldTouch = firetouchinterest
-        firetouchinterest = function(part1, part2, toggle)
+        getgenv().firetouchinterest = function(part1, part2, toggle)
             if capturing then
-                local p1 = part1 and part1:GetFullName() or "nil"
-                local p2 = part2 and part2:GetFullName() or "nil"
-                local mode = toggle == 0 and "BEGIN" or "END"
-                addLog("TOUCH", mode, p1 .. " → " .. p2)
+                task.defer(function()
+                    local p1 = part1 and part1.Name or "nil"
+                    local p2 = part2 and part2.Name or "nil"
+                    addLog("TOUCH", toggle == 0 and "BEGIN" or "END", p1 .. " → " .. p2)
+                end)
             end
             return oldTouch(part1, part2, toggle)
         end
     end
 end)
 
--- Hook 4: fireproximityprompt (if available)
+-- Hook fireproximityprompt (SAFE)
 pcall(function()
     if fireproximityprompt then
         local oldPrompt = fireproximityprompt
-        fireproximityprompt = function(prompt, ...)
+        getgenv().fireproximityprompt = function(prompt, ...)
             if capturing then
-                local name = prompt and prompt:GetFullName() or "nil"
-                addLog("PROMPT", "Fired", name)
+                task.defer(function()
+                    addLog("PROMPT", "Fired", prompt and prompt.Name or "nil")
+                end)
             end
             return oldPrompt(prompt, ...)
-        end
-    end
-end)
-
--- Hook 5: firesignal (if available - Delta supports this)
-pcall(function()
-    if firesignal then
-        local oldSignal = firesignal
-        firesignal = function(signal, ...)
-            if capturing then
-                local signalName = tostring(signal)
-                addLog("SIGNAL", "Fired", signalName .. " | " .. serializeArgs(...))
-            end
-            return oldSignal(signal, ...)
-        end
-    end
-end)
-
--- Hook 6: Also hook UnreliableRemoteEvents
-pcall(function()
-    for _, obj in pairs(RS:GetDescendants()) do
-        if obj:IsA("UnreliableRemoteEvent") then
-            obj.OnClientEvent:Connect(function(...)
-                if capturing then
-                    addLog("S→C", "[U] " .. obj.Name, serializeArgs(...))
-                end
-            end)
         end
     end
 end)
