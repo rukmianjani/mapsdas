@@ -1319,7 +1319,6 @@ local function DiscoverAllScripts()
             for _, item in ipairs(gcItems) do
                 if type(item) == "table" then
                     pcall(function()
-                        -- Some modules store script references in tables
                         for k, v in pairs(item) do
                             if typeof(v) == "Instance" and (v:IsA("BaseScript") or v:IsA("ModuleScript")) then
                                 addScript(v, "gc_table")
@@ -1338,6 +1337,7 @@ end
 
 -- ============================================
 -- MAIN DUMPER - OVERPOWERED EDITION
+-- STREAMING SAVE: setiap data langsung ditulis
 -- ============================================
 local function DumpEverything()
     if DUMP_RUNNING then
@@ -1364,6 +1364,7 @@ local function DumpEverything()
     
     Log("=== STARTING ULTIMATE MAP RIP v4.0 ===")
     Log("Game: " .. gameName .. " (ID: " .. gameId .. ")")
+    Log("MODE: Streaming Save (langsung tulis per-item)")
     UpdateStatus("Initializing...")
     
     -- Create folder structure
@@ -1386,6 +1387,67 @@ local function DumpEverything()
     MakeFolder(ROOT .. "/Terrain")
     MakeFolder(ROOT .. "/Reports")
     
+    -- ═══ STREAMING FILE PATHS ═══
+    local STREAM = {
+        combined  = ROOT .. "/Scripts/ALL_SCRIPTS.lua",
+        tree      = ROOT .. "/Hierarchy/FULL_TREE.txt",
+        props     = ROOT .. "/Properties/properties_001.txt",
+        sounds    = ROOT .. "/Sounds/ALL_SOUNDS.txt",
+        guis      = ROOT .. "/GUIs/gui_data_1.txt",
+        values    = ROOT .. "/Values/ALL_VALUES.txt",
+        anims     = ROOT .. "/Animations/ALL_ANIMATIONS.txt",
+        models    = ROOT .. "/Models/parts_1.txt",
+        assets    = ROOT .. "/Assets/ALL_ASSETS.txt",
+    }
+    
+    -- Chunk size trackers (for splitting large files)
+    local chunkSizes = {
+        combined = 0, combinedNum = 1,
+        props = 0, propsNum = 1,
+        guis = 0, guisNum = 1,
+        models = 0, modelsNum = 1,
+    }
+    local CHUNK_LIMIT = 400000
+    
+    -- Init streaming files with headers
+    SafeWrite(STREAM.combined, "-- ALL SCRIPTS FROM MAP - ULTIMATE DUMP v4.0 (STREAMING)\n-- Game: " .. gameName .. "\n-- Setiap script ditulis langsung saat berhasil di-extract\n\n")
+    SafeWrite(STREAM.tree, "FULL HIERARCHY TREE\nGame: " .. gameName .. " (ID: " .. gameId .. ")\n\n")
+    SafeWrite(STREAM.props, "ALL PROPERTIES\nGame: " .. gameName .. "\n\n")
+    SafeWrite(STREAM.sounds, "ALL SOUNDS\n" .. string.rep("=", 40) .. "\n\n")
+    SafeWrite(STREAM.guis, "ALL GUI ELEMENTS\n" .. string.rep("=", 40) .. "\n\n")
+    SafeWrite(STREAM.values, "ALL VALUE OBJECTS\n" .. string.rep("=", 40) .. "\n\n")
+    SafeWrite(STREAM.anims, "ALL ANIMATIONS\n" .. string.rep("=", 40) .. "\n\n")
+    SafeWrite(STREAM.models, "ALL MODELS/PARTS\n" .. string.rep("=", 40) .. "\n\n")
+    SafeWrite(STREAM.assets, "ALL ASSET IDS FROM MAP\n" .. string.rep("=", 60) .. "\n\n")
+    
+    -- Helper: append to chunked file
+    local function StreamAppend(key, content)
+        SafeAppend(STREAM[key], content)
+        chunkSizes[key] = (chunkSizes[key] or 0) + #content
+        
+        -- Auto-split jika terlalu besar
+        if chunkSizes[key] and chunkSizes[key] > CHUNK_LIMIT then
+            if key == "combined" then
+                chunkSizes.combinedNum = chunkSizes.combinedNum + 1
+                STREAM.combined = ROOT .. "/Scripts/ALL_SCRIPTS_part" .. chunkSizes.combinedNum .. ".lua"
+                SafeWrite(STREAM.combined, "-- ALL SCRIPTS (Part " .. chunkSizes.combinedNum .. ")\n\n")
+            elseif key == "props" then
+                chunkSizes.propsNum = chunkSizes.propsNum + 1
+                STREAM.props = ROOT .. "/Properties/properties_" .. string.format("%03d", chunkSizes.propsNum) .. ".txt"
+                SafeWrite(STREAM.props, "")
+            elseif key == "guis" then
+                chunkSizes.guisNum = chunkSizes.guisNum + 1
+                STREAM.guis = ROOT .. "/GUIs/gui_data_" .. chunkSizes.guisNum .. ".txt"
+                SafeWrite(STREAM.guis, "")
+            elseif key == "models" then
+                chunkSizes.modelsNum = chunkSizes.modelsNum + 1
+                STREAM.models = ROOT .. "/Models/parts_" .. chunkSizes.modelsNum .. ".txt"
+                SafeWrite(STREAM.models, "")
+            end
+            chunkSizes[key] = 0
+        end
+    end
+    
     -- ALL containers to scan
     local services = {
         {Workspace, "Workspace"},
@@ -1404,19 +1466,10 @@ local function DumpEverything()
     pcall(function() table.insert(services, {game:GetService("ServerStorage"), "ServerStorage"}) end)
     pcall(function() table.insert(services, {game:GetService("ServerScriptService"), "ServerScriptService"}) end)
     
-    -- Data storage
-    local allScriptData = {}
-    local allTreeLines = {}
-    local allPropertiesData = {}
-    local allSoundData = {}
-    local allGuiData = {}
-    local allValueData = {}
-    local allAnimData = {}
-    local allModelData = {}
     local scriptCounter = 0
-    local processedScripts = {} -- track already processed scripts
+    local processedScripts = {}
     
-    -- ========== RECURSIVE SCANNER (for hierarchy + assets + non-script data) ==========
+    -- ========== RECURSIVE SCANNER (STREAMING) ==========
     local function ScanRecursive(instance, path, depth, serviceName)
         if depth > 100 then return end
         
@@ -1427,15 +1480,14 @@ local function DumpEverything()
         local fullPath = path .. "/" .. name
         local fullName = instance:GetFullName()
         
-        -- Tree line
+        -- ═══ STREAM: Tree ═══
         local indent = string.rep("│ ", depth)
-        local treeEntry = indent .. "├─ [" .. className .. "] " .. instance.Name
-        allTreeLines[#allTreeLines+1] = treeEntry
+        SafeAppend(STREAM.tree, indent .. "├─ [" .. className .. "] " .. instance.Name .. "\n")
         
         -- Collect assets
         CollectAssets(instance)
         
-        -- ===== SCRIPTS - Process with UltimateDecompile =====
+        -- ═══ SCRIPTS: Process + SAVE IMMEDIATELY ═══
         if (instance:IsA("BaseScript") or instance:IsA("ModuleScript")) and not processedScripts[instance] then
             processedScripts[instance] = true
             totalScripts = totalScripts + 1
@@ -1468,9 +1520,7 @@ local function DumpEverything()
                 "-- METHOD: %s\n" ..
                 "-- LAYERS: %s\n" ..
                 "-- ============================================================\n\n",
-                instance.Name,
-                typeLabel, className,
-                fullName,
+                instance.Name, typeLabel, className, fullName,
                 instance.Parent and instance.Parent.Name or "nil",
                 instance.Parent and instance.Parent.ClassName or "nil",
                 serviceName,
@@ -1479,11 +1529,22 @@ local function DumpEverything()
                 table.concat(decompResult.layers or {}, " → ")
             )
             
-            -- Save individual script file
-            local fileName = string.format("%04d", scriptCounter) .. "_" .. name .. ext
-            SafeWrite(ROOT .. "/Scripts/" .. scriptType .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
+            local scriptContent = header .. (decompResult.source or "-- EMPTY")
             
-            -- Save bytecode separately if available
+            -- ✅ SAVE INDIVIDUAL FILE IMMEDIATELY
+            local fileName = string.format("%04d", scriptCounter) .. "_" .. name .. ext
+            SafeWrite(ROOT .. "/Scripts/" .. scriptType .. "/" .. fileName, scriptContent)
+            
+            -- ✅ APPEND TO COMBINED FILE IMMEDIATELY
+            local combinedEntry = string.format(
+                "\n\n%s\n-- [%d] %s (%s) [%s]\n-- Path: %s\n-- Service: %s\n%s\n",
+                string.rep("=", 70), scriptCounter,
+                instance.Name, className, decompResult.method,
+                fullName, serviceName, string.rep("=", 70)
+            ) .. (decompResult.source or "-- EMPTY") .. "\n"
+            StreamAppend("combined", combinedEntry)
+            
+            -- ✅ SAVE BYTECODE IMMEDIATELY
             if decompResult.bytecodeB64 then
                 SafeWrite(ROOT .. "/Scripts/Bytecode/" .. string.format("%04d", scriptCounter) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
                 if decompResult.bytecodeHex then
@@ -1491,27 +1552,16 @@ local function DumpEverything()
                 end
             end
             
-            -- Save environment dump separately if available
+            -- ✅ SAVE ENV IMMEDIATELY
             if decompResult.envDump then
                 SafeWrite(ROOT .. "/Scripts/Environment/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_env.lua", decompResult.envDump)
             end
             
-            -- Save debug info separately
+            -- ✅ SAVE DEBUG INFO IMMEDIATELY
             if decompResult.debugInfo and decompResult.debugInfo.lines and #decompResult.debugInfo.lines > 0 then
                 SafeWrite(ROOT .. "/Scripts/DebugInfo/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_debug.txt",
                     table.concat(decompResult.debugInfo.lines, "\n"))
             end
-            
-            -- Store for combined file
-            allScriptData[#allScriptData+1] = {
-                name = instance.Name,
-                class = className,
-                path = fullName,
-                service = serviceName,
-                source = decompResult.source or "-- EMPTY",
-                method = decompResult.method,
-                hash = decompResult.hash,
-            }
             
             local icon = "✅"
             if decompResult.method == "failed" then icon = "❌"
@@ -1519,77 +1569,73 @@ local function DumpEverything()
             elseif decompResult.method:find("bytecode") then icon = "📦"
             end
             
-            Log(icon .. " #" .. scriptCounter .. " [" .. decompResult.method .. "] " .. instance.Name)
+            Log(icon .. " #" .. scriptCounter .. " [" .. decompResult.method .. "] " .. instance.Name .. " → SAVED")
         end
         
-        -- ===== SOUNDS =====
+        -- ═══ STREAM: Sounds ═══
         if instance:IsA("Sound") then
-            local soundInfo = string.format("Name: %s\nPath: %s\nSoundId: %s\nVolume: %s\nLooped: %s\nPlaybackSpeed: %s\n",
+            local soundInfo = string.format("Name: %s\nPath: %s\nSoundId: %s\nVolume: %s\nLooped: %s\nPlaybackSpeed: %s\n%s\n",
                 instance.Name, fullName,
                 tostring(pcall(function() return instance.SoundId end) and instance.SoundId or "?"),
                 tostring(pcall(function() return instance.Volume end) and instance.Volume or "?"),
                 tostring(pcall(function() return instance.Looped end) and instance.Looped or "?"),
-                tostring(pcall(function() return instance.PlaybackSpeed end) and instance.PlaybackSpeed or "?")
+                tostring(pcall(function() return instance.PlaybackSpeed end) and instance.PlaybackSpeed or "?"),
+                string.rep("-", 30)
             )
-            allSoundData[#allSoundData+1] = soundInfo
+            SafeAppend(STREAM.sounds, soundInfo)
         end
         
-        -- ===== GUI ELEMENTS =====
+        -- ═══ STREAM: GUI Elements ═══
         if instance:IsA("GuiObject") or instance:IsA("ScreenGui") or instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then
             local guiInfo = string.format("[%s] %s\n  Path: %s\n", className, instance.Name, fullName)
             local props = GetAllProperties(instance)
             for k, v in pairs(props) do
                 guiInfo = guiInfo .. "  " .. k .. " = " .. v .. "\n"
             end
-            allGuiData[#allGuiData+1] = guiInfo
+            StreamAppend("guis", guiInfo .. "\n")
         end
         
-        -- ===== VALUE OBJECTS =====
+        -- ═══ STREAM: Value Objects ═══
         if instance:IsA("ValueBase") then
             local valOk, valVal = pcall(function() return instance.Value end)
-            local valueInfo = string.format("[%s] %s = %s\n  Path: %s\n",
-                className, instance.Name,
-                valOk and tostring(valVal) or "?",
-                fullName
-            )
-            allValueData[#allValueData+1] = valueInfo
+            SafeAppend(STREAM.values, string.format("[%s] %s = %s\n  Path: %s\n\n",
+                className, instance.Name, valOk and tostring(valVal) or "?", fullName))
         end
         
-        -- ===== ANIMATIONS =====
+        -- ═══ STREAM: Animations ═══
         if instance:IsA("Animation") or instance:IsA("AnimationTrack") or className == "Animator" then
             local animId = ""
             pcall(function() animId = instance.AnimationId end)
-            local animInfo = string.format("[%s] %s\n  Path: %s\n  AnimationId: %s\n",
-                className, instance.Name, fullName, animId)
-            allAnimData[#allAnimData+1] = animInfo
+            SafeAppend(STREAM.anims, string.format("[%s] %s\n  Path: %s\n  AnimationId: %s\n\n",
+                className, instance.Name, fullName, animId))
         end
         
-        -- ===== MODELS (BasePart data) =====
+        -- ═══ STREAM: Models/Parts ═══
         if instance:IsA("BasePart") then
             local props = GetAllProperties(instance)
             local modelInfo = string.format("[%s] %s\n  Path: %s\n", className, instance.Name, fullName)
             for k, v in pairs(props) do
                 modelInfo = modelInfo .. "  " .. k .. " = " .. v .. "\n"
             end
-            allModelData[#allModelData+1] = modelInfo
+            StreamAppend("models", modelInfo .. "\n")
         end
         
-        -- ===== ALL PROPERTIES =====
+        -- ═══ STREAM: Properties ═══
         local propsLine = string.format("\n=== [%s] %s ===\nPath: %s\n", className, instance.Name, fullName)
         local props = GetAllProperties(instance)
         for k, v in pairs(props) do
             propsLine = propsLine .. "  " .. k .. " = " .. v .. "\n"
         end
-        allPropertiesData[#allPropertiesData+1] = propsLine
+        StreamAppend("props", propsLine)
         
-        -- Yield to prevent crash
+        -- Yield
         if totalInstances % 150 == 0 then
             task.wait()
-            UpdateStatus("Scanning " .. serviceName .. "... (" .. totalInstances .. ")")
+            UpdateStatus("Scanning " .. serviceName .. "... (" .. totalInstances .. " | " .. scriptCounter .. " scripts saved)")
             UpdateProgress()
         end
         
-        -- ===== SCAN CHILDREN =====
+        -- Scan children
         local children = {}
         pcall(function() children = instance:GetChildren() end)
         
@@ -1597,7 +1643,6 @@ local function DumpEverything()
             local skip = false
             if child == LocalPlayer.Character then skip = true end
             if child:IsA("Camera") and child.Parent == Workspace then skip = true end
-            
             if not skip then
                 ScanRecursive(child, fullPath, depth + 1, serviceName)
             end
@@ -1605,15 +1650,13 @@ local function DumpEverything()
     end
     
     -- ========== PHASE 1: SCAN ALL SERVICES ==========
-    Log(">>> PHASE 1: Scanning Services...")
+    Log(">>> PHASE 1: Scanning Services (streaming save)...")
     for _, svc in ipairs(services) do
         local container, svcName = svc[1], svc[2]
         Log(">>> Scanning: " .. svcName)
         UpdateStatus("Scanning: " .. svcName)
         
-        allTreeLines[#allTreeLines+1] = "\n" .. string.rep("=", 60)
-        allTreeLines[#allTreeLines+1] = "SERVICE: " .. svcName
-        allTreeLines[#allTreeLines+1] = string.rep("=", 60)
+        SafeAppend(STREAM.tree, "\n" .. string.rep("=", 60) .. "\nSERVICE: " .. svcName .. "\n" .. string.rep("=", 60) .. "\n")
         
         pcall(function()
             for _, child in ipairs(container:GetChildren()) do
@@ -1626,9 +1669,7 @@ local function DumpEverything()
     Log(">>> PHASE 2: Scanning Player data...")
     UpdateStatus("Scanning Player data...")
     pcall(function()
-        allTreeLines[#allTreeLines+1] = "\n" .. string.rep("=", 60)
-        allTreeLines[#allTreeLines+1] = "PLAYER DATA: " .. LocalPlayer.Name
-        allTreeLines[#allTreeLines+1] = string.rep("=", 60)
+        SafeAppend(STREAM.tree, "\n" .. string.rep("=", 60) .. "\nPLAYER DATA: " .. LocalPlayer.Name .. "\n" .. string.rep("=", 60) .. "\n")
         
         pcall(function()
             for _, child in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
@@ -1680,7 +1721,6 @@ local function DumpEverything()
                 typeLabel = "Module"
             end
             
-            -- Check if it's a nil instance (hidden script)
             local isNil = false
             pcall(function() isNil = obj.Parent == nil end)
             if isNil then scriptType = "NilScripts" end
@@ -1698,16 +1738,26 @@ local function DumpEverything()
                 "-- METHOD: %s\n" ..
                 "-- LAYERS: %s\n" ..
                 "-- ============================================================\n\n",
-                obj.Name, typeLabel, obj.ClassName,
-                fullName, discoverySource,
-                tostring(isNil),
+                obj.Name, typeLabel, obj.ClassName, fullName,
+                discoverySource, tostring(isNil),
                 decompResult.method,
                 table.concat(decompResult.layers or {}, " → ")
             )
             
             local name = SafeName(obj.Name)
+            
+            -- ✅ SAVE IMMEDIATELY
             local fileName = string.format("%04d", scriptCounter) .. "_EXTRA_" .. name .. ext
             SafeWrite(ROOT .. "/Scripts/" .. scriptType .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
+            
+            -- ✅ APPEND TO COMBINED IMMEDIATELY
+            local combinedEntry = string.format(
+                "\n\n%s\n-- [%d] EXTRA %s (%s) [%s] from %s\n-- Path: %s\n%s\n",
+                string.rep("=", 70), scriptCounter,
+                obj.Name, obj.ClassName, decompResult.method,
+                discoverySource, fullName, string.rep("=", 70)
+            ) .. (decompResult.source or "-- EMPTY") .. "\n"
+            StreamAppend("combined", combinedEntry)
             
             if decompResult.bytecodeB64 then
                 SafeWrite(ROOT .. "/Scripts/Bytecode/" .. string.format("%04d", scriptCounter) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
@@ -1716,17 +1766,7 @@ local function DumpEverything()
                 SafeWrite(ROOT .. "/Scripts/Environment/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_env.lua", decompResult.envDump)
             end
             
-            allScriptData[#allScriptData+1] = {
-                name = obj.Name,
-                class = obj.ClassName,
-                path = fullName,
-                service = "EXTRA:" .. discoverySource,
-                source = decompResult.source or "-- EMPTY",
-                method = decompResult.method,
-                hash = decompResult.hash,
-            }
-            
-            Log("🔍 EXTRA #" .. scriptCounter .. " [" .. discoverySource .. "] " .. obj.Name)
+            Log("🔍 EXTRA #" .. scriptCounter .. " [" .. discoverySource .. "] " .. obj.Name .. " → SAVED")
             
             if extraFound % 5 == 0 then
                 task.wait()
@@ -1736,115 +1776,23 @@ local function DumpEverything()
     end
     Log("Extra scripts found: " .. extraFound)
     
-    -- ========== PHASE 4: SAVE ALL DATA ==========
-    UpdateStatus("Saving all data...")
-    Log(">>> PHASE 4: Saving files...")
+    -- ========== PHASE 4: FINAL DATA (assets + report + summary) ==========
+    UpdateStatus("Saving final data...")
+    Log(">>> PHASE 4: Final data...")
     
-    -- 1. Full hierarchy tree
-    SafeWrite(ROOT .. "/Hierarchy/FULL_TREE.txt", table.concat(allTreeLines, "\n"))
-    
-    -- 2. All scripts combined (chunked for large games)
-    local combinedScripts = "-- ALL SCRIPTS FROM MAP - ULTIMATE DUMP v4.0\n-- Game: " .. gameName .. "\n-- Total: " .. #allScriptData .. " scripts\n\n"
-    local chunkNum = 1
-    for i, s in ipairs(allScriptData) do
-        combinedScripts = combinedScripts .. string.format(
-            "\n\n%s\n-- [%d/%d] %s (%s) [%s]\n-- Path: %s\n-- Service: %s\n%s\n",
-            string.rep("=", 70), i, #allScriptData,
-            s.name, s.class, s.method, s.path, s.service,
-            string.rep("=", 70)
-        ) .. s.source
-        
-        if #combinedScripts > 400000 then
-            SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS_part" .. chunkNum .. ".lua", combinedScripts)
-            combinedScripts = ""
-            chunkNum = chunkNum + 1
-        end
-    end
-    if combinedScripts ~= "" then
-        if chunkNum > 1 then
-            SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS_part" .. chunkNum .. ".lua", combinedScripts)
-        else
-            SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS.lua", combinedScripts)
-        end
-    end
-    
-    -- 3. Properties (chunked)
-    local propsChunk = ""
-    local propsChunkNum = 1
-    for _, p in ipairs(allPropertiesData) do
-        propsChunk = propsChunk .. p
-        if #propsChunk > 300000 then
-            SafeWrite(ROOT .. "/Properties/properties_" .. string.format("%03d", propsChunkNum) .. ".txt", propsChunk)
-            propsChunk = ""
-            propsChunkNum = propsChunkNum + 1
-        end
-    end
-    if propsChunk ~= "" then
-        SafeWrite(ROOT .. "/Properties/properties_" .. string.format("%03d", propsChunkNum) .. ".txt", propsChunk)
-    end
-    
-    -- 4. Asset list
-    local assetText = "ALL ASSET IDS FROM MAP\n" .. string.rep("=", 60) .. "\n\n"
+    -- Assets (collected during scan, write now)
+    local assetText = ""
     for id, info in pairs(assetList) do
         assetText = assetText .. string.format("Asset: %s\n  Property: %s\n  Instance: %s\n  Class: %s\n\n",
             id, info.property, info.instance, info.className)
     end
-    SafeWrite(ROOT .. "/Assets/ALL_ASSETS.txt", assetText)
+    SafeAppend(STREAM.assets, assetText)
     
-    -- 5. Sounds
-    if #allSoundData > 0 then
-        SafeWrite(ROOT .. "/Sounds/ALL_SOUNDS.txt", "ALL SOUNDS\n" .. string.rep("=", 40) .. "\n\n" .. table.concat(allSoundData, "\n" .. string.rep("-", 30) .. "\n"))
-    end
-    
-    -- 6. GUIs (chunked)
-    if #allGuiData > 0 then
-        local guiChunk = ""
-        local guiChunkNum = 1
-        for _, g in ipairs(allGuiData) do
-            guiChunk = guiChunk .. g .. "\n"
-            if #guiChunk > 300000 then
-                SafeWrite(ROOT .. "/GUIs/gui_data_" .. guiChunkNum .. ".txt", guiChunk)
-                guiChunk = ""
-                guiChunkNum = guiChunkNum + 1
-            end
-        end
-        if guiChunk ~= "" then
-            SafeWrite(ROOT .. "/GUIs/gui_data_" .. guiChunkNum .. ".txt", guiChunk)
-        end
-    end
-    
-    -- 7. Values
-    if #allValueData > 0 then
-        SafeWrite(ROOT .. "/Values/ALL_VALUES.txt", "ALL VALUE OBJECTS\n" .. string.rep("=", 40) .. "\n\n" .. table.concat(allValueData, "\n"))
-    end
-    
-    -- 8. Animations
-    if #allAnimData > 0 then
-        SafeWrite(ROOT .. "/Animations/ALL_ANIMATIONS.txt", "ALL ANIMATIONS\n" .. string.rep("=", 40) .. "\n\n" .. table.concat(allAnimData, "\n"))
-    end
-    
-    -- 9. Models/Parts (chunked)
-    if #allModelData > 0 then
-        local modelChunk = ""
-        local modelChunkNum = 1
-        for _, m in ipairs(allModelData) do
-            modelChunk = modelChunk .. m .. "\n"
-            if #modelChunk > 300000 then
-                SafeWrite(ROOT .. "/Models/parts_" .. modelChunkNum .. ".txt", modelChunk)
-                modelChunk = ""
-                modelChunkNum = modelChunkNum + 1
-            end
-        end
-        if modelChunk ~= "" then
-            SafeWrite(ROOT .. "/Models/parts_" .. modelChunkNum .. ".txt", modelChunk)
-        end
-    end
-    
-    -- 10. saveinstance with MAXIMUM options
+    -- saveinstance
     pcall(function()
         if saveinstance then
             UpdateStatus("Saving full instance (RBXLX)...")
-            Log("Attempting saveinstance with full options...")
+            Log("Attempting saveinstance...")
             saveinstance({
                 FilePath = ROOT .. "/FULL_MAP.rbxlx",
                 Decompile = true,
@@ -1862,17 +1810,17 @@ local function DumpEverything()
         end
     end)
     
-    -- 11. DECOMPILE REPORT
+    -- Decompile Report
     local reportLines = {}
-    reportLines[#reportLines+1] = "╔═══════════════════════════════════════════════════════════╗"
-    reportLines[#reportLines+1] = "║        DECOMPILE REPORT - ULTIMATE MAP DUMPER v4.0       ║"
-    reportLines[#reportLines+1] = "╚═══════════════════════════════════════════════════════════╝"
+    reportLines[#reportLines+1] = string.rep("=", 60)
+    reportLines[#reportLines+1] = "  DECOMPILE REPORT - ULTIMATE MAP DUMPER v4.0"
+    reportLines[#reportLines+1] = string.rep("=", 60)
     reportLines[#reportLines+1] = ""
     reportLines[#reportLines+1] = "Game: " .. gameName .. " (ID: " .. gameId .. ")"
     reportLines[#reportLines+1] = "Date: " .. os.date("%Y-%m-%d %H:%M:%S")
     reportLines[#reportLines+1] = "Player: " .. LocalPlayer.Name
     reportLines[#reportLines+1] = ""
-    reportLines[#reportLines+1] = "═══ EXECUTOR CAPABILITIES ═══"
+    reportLines[#reportLines+1] = "=== EXECUTOR CAPABILITIES ==="
     reportLines[#reportLines+1] = "  decompile:           " .. tostring(HAS_DECOMPILE)
     reportLines[#reportLines+1] = "  getscriptbytecode:   " .. tostring(HAS_GETSCRIPTBYTECODE)
     reportLines[#reportLines+1] = "  getscripthash:       " .. tostring(HAS_GETSCRIPTHASH)
@@ -1889,131 +1837,69 @@ local function DumpEverything()
     reportLines[#reportLines+1] = "  debug.info:          " .. tostring(HAS_DEBUG_GETINFO)
     reportLines[#reportLines+1] = "  saveinstance:        " .. tostring(type(saveinstance) == "function")
     reportLines[#reportLines+1] = ""
-    reportLines[#reportLines+1] = "═══ STATISTICS ═══"
+    reportLines[#reportLines+1] = "=== STATISTICS ==="
     reportLines[#reportLines+1] = "  Total Scripts:          " .. DecompileStats.total
-    reportLines[#reportLines+1] = "  ✅ Decompiled:          " .. DecompileStats.decompiled
-    reportLines[#reportLines+1] = "  ✅ Source Property:      " .. DecompileStats.source_prop
-    reportLines[#reportLines+1] = "  ✅ Closure Decompiled:   " .. DecompileStats.closure_decompiled
-    reportLines[#reportLines+1] = "  ✅ Module Required:      " .. DecompileStats.module_required
-    reportLines[#reportLines+1] = "  ⚠️ Bytecode Saved:      " .. DecompileStats.bytecode_saved
-    reportLines[#reportLines+1] = "  ⚠️ Env Dumped:           " .. DecompileStats.env_dumped
-    reportLines[#reportLines+1] = "  ⚠️ Debug Extracted:      " .. DecompileStats.debug_extracted
-    reportLines[#reportLines+1] = "  ⚠️ GC Recovered:         " .. DecompileStats.gc_recovered
-    reportLines[#reportLines+1] = "  ❌ Total Failed:         " .. DecompileStats.total_failed
-    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "  Decompiled:             " .. DecompileStats.decompiled
+    reportLines[#reportLines+1] = "  Source Property:        " .. DecompileStats.source_prop
+    reportLines[#reportLines+1] = "  Closure Decompiled:     " .. DecompileStats.closure_decompiled
+    reportLines[#reportLines+1] = "  Module Required:        " .. DecompileStats.module_required
+    reportLines[#reportLines+1] = "  Bytecode Saved:         " .. DecompileStats.bytecode_saved
+    reportLines[#reportLines+1] = "  Env Dumped:             " .. DecompileStats.env_dumped
+    reportLines[#reportLines+1] = "  Debug Extracted:        " .. DecompileStats.debug_extracted
+    reportLines[#reportLines+1] = "  GC Recovered:           " .. DecompileStats.gc_recovered
+    reportLines[#reportLines+1] = "  Total Failed:           " .. DecompileStats.total_failed
     
     local successRate = 0
     if DecompileStats.total > 0 then
         local success = DecompileStats.decompiled + DecompileStats.source_prop + DecompileStats.closure_decompiled + DecompileStats.module_required
         successRate = math.floor(success / DecompileStats.total * 100)
     end
-    reportLines[#reportLines+1] = "  SUCCESS RATE: " .. successRate .. "%"
     local dataRate = 0
     if DecompileStats.total > 0 then
         dataRate = math.floor((DecompileStats.total - DecompileStats.total_failed) / DecompileStats.total * 100)
     end
-    reportLines[#reportLines+1] = "  DATA RATE (some data extracted): " .. dataRate .. "%"
     reportLines[#reportLines+1] = ""
-    reportLines[#reportLines+1] = "═══ PER-SCRIPT RESULTS ═══"
+    reportLines[#reportLines+1] = "  SUCCESS RATE:           " .. successRate .. "%"
+    reportLines[#reportLines+1] = "  DATA RATE:              " .. dataRate .. "%"
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "=== PER-SCRIPT RESULTS ==="
     for scriptPath, method in pairs(DecompileStats.methods) do
-        local icon = "✅"
-        if method == "failed" then icon = "❌"
-        elseif method == "fallback_composite" then icon = "⚠️"
-        elseif method:find("bytecode") then icon = "📦"
-        end
+        local icon = "[OK]"
+        if method == "failed" then icon = "[FAIL]"
+        elseif method == "fallback_composite" then icon = "[PARTIAL]"
+        elseif method:find("bytecode") then icon = "[BYTES]" end
         reportLines[#reportLines+1] = "  " .. icon .. " [" .. method .. "] " .. scriptPath
     end
     reportLines[#reportLines+1] = ""
-    reportLines[#reportLines+1] = "═══ GENERAL STATS ═══"
-    reportLines[#reportLines+1] = "  Total Instances Scanned: " .. totalInstances
-    reportLines[#reportLines+1] = "  Total Scripts Found:     " .. totalScripts
-    reportLines[#reportLines+1] = "  Extra Scripts (hidden):  " .. extraFound
-    reportLines[#reportLines+1] = "  Total Assets:            " .. totalAssets
-    reportLines[#reportLines+1] = "  Total Files Written:     " .. totalFiles
+    reportLines[#reportLines+1] = "=== GENERAL ==="
+    reportLines[#reportLines+1] = "  Total Instances:        " .. totalInstances
+    reportLines[#reportLines+1] = "  Total Scripts:          " .. totalScripts
+    reportLines[#reportLines+1] = "  Extra Scripts:          " .. extraFound
+    reportLines[#reportLines+1] = "  Total Assets:           " .. totalAssets
+    reportLines[#reportLines+1] = "  Total Files:            " .. totalFiles
     
     SafeWrite(ROOT .. "/Reports/DECOMPILE_REPORT.txt", table.concat(reportLines, "\n"))
     
-    -- 12. Summary
-    local summary = string.format([[
-================================================================
-         ULTIMATE MAP RIP v4.0 - COMPLETE SUMMARY
-================================================================
-
-Game Name     : %s
-Place ID      : %d
-Game ID       : %d
-Date          : %s
-Dumped By     : %s
-
-================================================================
-                    DECOMPILE STATISTICS
-================================================================
-
-Total Scripts         : %d
-Decompiled OK         : %d
-Source Property        : %d  
-Closure Decompiled    : %d
-Module Required       : %d
-Bytecode Saved        : %d
-Env Dumped            : %d
-Debug Extracted       : %d
-GC Recovered          : %d
-Total Failed          : %d
-SUCCESS RATE          : %d%%
-DATA RATE             : %d%%
-
-================================================================
-                     GENERAL STATISTICS
-================================================================
-
-Total Instances Scanned  : %d
-Total Scripts Found      : %d
-Extra Scripts (hidden)   : %d
-Total Unique Assets      : %d
-Total Files Written      : %d
-
-================================================================
-                    OUTPUT STRUCTURE
-================================================================
-
-📁 %s/
-├── 📁 Scripts/
-│   ├── 📁 LocalScripts/     (.client.lua)
-│   ├── 📁 ServerScripts/    (.server.lua)
-│   ├── 📁 ModuleScripts/    (.module.lua)
-│   ├── 📁 NilScripts/       (hidden scripts, parent=nil)
-│   ├── 📁 Bytecode/         (.b64 & .hex files)
-│   ├── 📁 Environment/      (getsenv dumps)
-│   ├── 📁 DebugInfo/        (constants/upvalues/protos)
-│   └── 📄 ALL_SCRIPTS*.lua  (combined)
-├── 📁 Hierarchy/
-├── 📁 Properties/
-├── 📁 Assets/
-├── 📁 Models/
-├── 📁 Sounds/
-├── 📁 GUIs/
-├── 📁 Values/
-├── 📁 Animations/
-├── 📁 Reports/
-│   └── 📄 DECOMPILE_REPORT.txt
-└── 📄 SUMMARY.txt
-
-================================================================
-]], 
-    gameName, game.PlaceId, game.GameId, os.date("%Y-%m-%d %H:%M:%S"), LocalPlayer.Name,
-    DecompileStats.total, DecompileStats.decompiled, DecompileStats.source_prop,
-    DecompileStats.closure_decompiled, DecompileStats.module_required,
-    DecompileStats.bytecode_saved, DecompileStats.env_dumped,
-    DecompileStats.debug_extracted, DecompileStats.gc_recovered,
-    DecompileStats.total_failed, successRate, dataRate,
-    totalInstances, totalScripts, extraFound, totalAssets, totalFiles,
-    ROOT)
-    
+    -- Summary
+    local summary = string.format(
+        "ULTIMATE MAP RIP v4.0 - SUMMARY\n" ..
+        string.rep("=", 50) .. "\n" ..
+        "Game: %s | ID: %d\n" ..
+        "Date: %s | By: %s\n" ..
+        "Scripts: %d | Success: %d%% | Data: %d%%\n" ..
+        "Instances: %d | Assets: %d | Files: %d\n" ..
+        "Extra (hidden): %d\n" ..
+        string.rep("=", 50) .. "\n",
+        gameName, game.PlaceId,
+        os.date("%Y-%m-%d %H:%M:%S"), LocalPlayer.Name,
+        DecompileStats.total, successRate, dataRate,
+        totalInstances, totalAssets, totalFiles, extraFound
+    )
     SafeWrite(ROOT .. "/SUMMARY.txt", summary)
     
     -- Done!
     Log("=== RIP COMPLETE ===")
-    Log(string.format("Total: %d instances, %d scripts (%d%% success), %d files", 
+    Log(string.format("Total: %d instances, %d scripts (%d%% success), %d files",
         totalInstances, totalScripts, successRate, totalFiles))
     UpdateStatus("✅ COMPLETE! " .. totalFiles .. " files | " .. successRate .. "% decompiled")
     UpdateProgress()
@@ -2028,7 +1914,7 @@ end
 -- ======================================================================
 
 -- ============================================
--- SCRIPTS ONLY DEEP DUMP (Enhanced)
+-- SCRIPTS ONLY DEEP DUMP (STREAMING SAVE)
 -- ============================================
 local function ScriptsOnlyDump()
     if DUMP_RUNNING then return end
@@ -2045,7 +1931,6 @@ local function ScriptsOnlyDump()
     MakeFolder(ROOT .. "/Environment")
     MakeFolder(ROOT .. "/ByFolder")
     
-    -- Reset stats
     DecompileStats = {
         total = 0, decompiled = 0, source_prop = 0,
         bytecode_saved = 0, env_dumped = 0, closure_decompiled = 0,
@@ -2059,17 +1944,42 @@ local function ScriptsOnlyDump()
     local moduleCount = 0
     local fileCount = 0
     
-    local folderScripts = {}
+    -- ═══ STREAMING: init combined file ═══
+    local combinedPath = ROOT .. "/ALL_SCRIPTS_combined.lua"
+    local combinedPartNum = 1
+    local combinedSize = 0
+    local CHUNK_LIMIT = 600000
     
-    Log("=== ULTIMATE SCRIPTS DUMP ===")
-    Log("Using 10+ layer decompile fallback")
+    SafeWrite(combinedPath, string.format(
+        "-- ALL GAME SCRIPTS - ULTIMATE DUMP v4.0 (STREAMING)\n" ..
+        "-- Game: %s (ID: %d)\n" ..
+        "-- Date: %s\n" ..
+        "-- Setiap script ditulis langsung saat berhasil di-extract\n\n",
+        gameName, gameId, os.date("%Y-%m-%d %H:%M:%S")
+    ))
+    fileCount = fileCount + 1
+    
+    -- ═══ STREAMING: init index file ═══
+    local indexPath = ROOT .. "/INDEX.txt"
+    SafeWrite(indexPath, string.format(
+        "ULTIMATE SCRIPTS DUMP - LIVE INDEX\n" ..
+        string.rep("=", 60) .. "\n" ..
+        "Game: %s (ID: %d)\n" ..
+        "Date: %s\n" ..
+        "(stats update di akhir proses)\n\n" ..
+        string.rep("=", 60) .. "\n\n",
+        gameName, gameId, os.date("%Y-%m-%d %H:%M:%S")
+    ))
+    fileCount = fileCount + 1
+    
+    Log("=== ULTIMATE SCRIPTS DUMP (STREAMING) ===")
+    Log("Setiap script langsung disave saat berhasil di-extract")
     UpdateStatus("Discovering ALL scripts...")
     
-    -- Use DiscoverAllScripts for maximum coverage
     local allScripts = DiscoverAllScripts()
     local total = #allScripts
     
-    Log("Found " .. total .. " scripts total. Starting extraction...")
+    Log("Found " .. total .. " scripts. Starting extraction + streaming save...")
     
     for idx, entry in ipairs(allScripts) do
         local obj = entry.instance
@@ -2102,12 +2012,10 @@ local function ScriptsOnlyDump()
             serverCount = serverCount + 1
         end
         
-        -- Check nil instance
         local isNil = false
         pcall(function() isNil = obj.Parent == nil end)
         if isNil then folder = "NilScripts" end
         
-        -- Header
         local header = string.format(
             "-- ============================================================\n" ..
             "-- SCRIPT: %s\n" ..
@@ -2120,54 +2028,76 @@ local function ScriptsOnlyDump()
             "-- ENABLED: %s\n" ..
             "-- LAYERS: %s\n" ..
             "-- ============================================================\n\n",
-            obj.Name, typeLabel, obj.ClassName,
-            fullPath,
+            obj.Name, typeLabel, obj.ClassName, fullPath,
             obj.Parent and obj.Parent.Name or "nil",
             obj.Parent and obj.Parent.ClassName or "nil",
-            discoverySource,
-            tostring(isNil),
+            discoverySource, tostring(isNil),
             decompResult.method,
             tostring(pcall(function() return obj.Enabled end) and (obj.Enabled ~= false) or "N/A"),
             table.concat(decompResult.layers or {}, " → ")
         )
         
-        -- Save individual
+        local scriptContent = header .. (decompResult.source or "-- EMPTY")
+        
+        -- ✅ SAVE INDIVIDUAL FILE IMMEDIATELY
         local fileName = string.format("%04d", scriptCount) .. "_" .. name .. ext
-        SafeWrite(ROOT .. "/" .. folder .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
+        SafeWrite(ROOT .. "/" .. folder .. "/" .. fileName, scriptContent)
         fileCount = fileCount + 1
         
-        -- Save bytecode
+        -- ✅ APPEND TO COMBINED FILE IMMEDIATELY
+        local combinedEntry = string.format(
+            "\n\n%s\n-- [%d/%d] %s (%s) [%s] from %s\n-- Path: %s\n%s\n",
+            string.rep("=", 70), scriptCount, total,
+            obj.Name, obj.ClassName, decompResult.method,
+            discoverySource, fullPath, string.rep("=", 70)
+        ) .. (decompResult.source or "-- EMPTY") .. "\n"
+        
+        SafeAppend(combinedPath, combinedEntry)
+        combinedSize = combinedSize + #combinedEntry
+        
+        -- Auto-split combined if too large
+        if combinedSize > CHUNK_LIMIT then
+            combinedPartNum = combinedPartNum + 1
+            combinedPath = ROOT .. "/ALL_SCRIPTS_combined_part" .. combinedPartNum .. ".lua"
+            SafeWrite(combinedPath, "-- ALL SCRIPTS (Part " .. combinedPartNum .. ")\n\n")
+            fileCount = fileCount + 1
+            combinedSize = 0
+        end
+        
+        -- ✅ SAVE BYTECODE IMMEDIATELY
         if decompResult.bytecodeB64 then
             SafeWrite(ROOT .. "/Bytecode/" .. string.format("%04d", scriptCount) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
             fileCount = fileCount + 1
         end
         
-        -- Save env
+        -- ✅ SAVE ENV IMMEDIATELY
         if decompResult.envDump then
             SafeWrite(ROOT .. "/Environment/" .. string.format("%04d", scriptCount) .. "_" .. name .. "_env.lua", decompResult.envDump)
             fileCount = fileCount + 1
         end
         
-        -- Organize by parent folder
+        -- ✅ SAVE BY-FOLDER IMMEDIATELY
         local svcName = discoverySource:match("service:(.+)") or discoverySource
         local folderKey = SafeName(svcName .. "/" .. (obj.Parent and obj.Parent.Name or "root"))
-        if not folderScripts[folderKey] then
-            folderScripts[folderKey] = {}
-        end
-        folderScripts[folderKey][#folderScripts[folderKey]+1] = {
-            name = obj.Name,
-            class = obj.ClassName,
-            path = fullPath,
-            source = decompResult.source or "-- EMPTY",
-            header = header,
-            method = decompResult.method,
-        }
+        local byFolderPath = ROOT .. "/ByFolder/" .. folderKey
+        MakeFolder(byFolderPath)
+        SafeWrite(byFolderPath .. "/" .. name .. "_" .. scriptCount .. ext, scriptContent)
+        fileCount = fileCount + 1
         
-        local icon = "✅"
-        if decompResult.method == "failed" then icon = "❌"
-        elseif decompResult.method == "fallback_composite" then icon = "⚠️" end
+        -- ✅ APPEND TO INDEX IMMEDIATELY
+        local icon = "[OK]"
+        if decompResult.method == "failed" then icon = "[FAIL]"
+        elseif decompResult.method == "fallback_composite" then icon = "[PARTIAL]" end
         
-        Log(icon .. " [" .. typeLabel .. "] " .. obj.Name .. " ← " .. discoverySource)
+        SafeAppend(indexPath, string.format("  %s %d. [%s] %s (%s)\n     Path: %s\n     From: %s\n\n",
+            icon, scriptCount, obj.ClassName, obj.Name, decompResult.method, fullPath, discoverySource))
+        
+        -- Log icon
+        local logIcon = "✅"
+        if decompResult.method == "failed" then logIcon = "❌"
+        elseif decompResult.method == "fallback_composite" then logIcon = "⚠️" end
+        
+        Log(logIcon .. " [" .. typeLabel .. "] " .. obj.Name .. " → SAVED")
         
         if scriptCount % 3 == 0 then
             task.wait(0.1)
@@ -2178,110 +2108,30 @@ local function ScriptsOnlyDump()
         end
     end
     
-    -- Save organized by folder
-    UpdateStatus("Saving by folder structure...")
-    for folderKey, scripts in pairs(folderScripts) do
-        local folderPath = ROOT .. "/ByFolder/" .. folderKey
-        MakeFolder(folderPath)
-        for i, s in ipairs(scripts) do
-            local fext = ".lua"
-            if s.class == "LocalScript" then fext = ".client.lua"
-            elseif s.class == "ModuleScript" then fext = ".module.lua"
-            else fext = ".server.lua" end
-            SafeWrite(folderPath .. "/" .. SafeName(s.name) .. "_" .. i .. fext, s.header .. s.source)
-            fileCount = fileCount + 1
-        end
-    end
-    
-    -- Save combined
-    UpdateStatus("Saving combined file...")
-    local combined = string.format(
-        "-- ============================================================\n" ..
-        "-- ALL GAME SCRIPTS - ULTIMATE DUMP v4.0\n" ..
-        "-- Game: %s (ID: %d)\n" ..
-        "-- Total Scripts: %d (Local: %d, Server: %d, Module: %d)\n" ..
-        "-- Date: %s\n" ..
-        "-- Decompile Rate: %d%% full | %d%% with data\n" ..
-        "-- ============================================================\n\n",
-        gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
-        os.date("%Y-%m-%d %H:%M:%S"),
-        DecompileStats.total > 0 and math.floor((DecompileStats.decompiled + DecompileStats.source_prop) / DecompileStats.total * 100) or 0,
-        DecompileStats.total > 0 and math.floor((DecompileStats.total - DecompileStats.total_failed) / DecompileStats.total * 100) or 0
-    )
-    
-    local partNum = 1
-    for folderKey, scripts in pairs(folderScripts) do
-        combined = combined .. "\n\n" .. string.rep("=", 70) .. "\n"
-        combined = combined .. "-- FOLDER: " .. folderKey .. " (" .. #scripts .. " scripts)\n"
-        combined = combined .. string.rep("=", 70) .. "\n"
-        for _, s in ipairs(scripts) do
-            combined = combined .. "\n" .. s.header .. s.source .. "\n"
-        end
-        if #combined > 600000 then
-            SafeWrite(ROOT .. "/ALL_SCRIPTS_combined_part" .. partNum .. ".lua", combined)
-            fileCount = fileCount + 1
-            combined = ""
-            partNum = partNum + 1
-        end
-    end
-    if combined ~= "" then
-        SafeWrite(ROOT .. "/ALL_SCRIPTS_combined.lua", combined)
-        fileCount = fileCount + 1
-    end
-    
-    -- Save index
+    -- ═══ FINAL: Update index with final stats ═══
     local successRate = DecompileStats.total > 0 and math.floor((DecompileStats.decompiled + DecompileStats.source_prop + DecompileStats.closure_decompiled + DecompileStats.module_required) / DecompileStats.total * 100) or 0
     
-    local indexText = string.format(
-        "ULTIMATE SCRIPTS DUMP - INDEX\n" ..
-        string.rep("=", 60) .. "\n" ..
-        "Game: %s (ID: %d)\n" ..
-        "Total Scripts: %d\n" ..
-        "  LocalScripts: %d\n" ..
-        "  ServerScripts: %d\n" ..
-        "  ModuleScripts: %d\n" ..
-        "Decompile Success Rate: %d%%\n" ..
-        "  Decompiled: %d\n" ..
-        "  Source Property: %d\n" ..
-        "  Closure Decompiled: %d\n" ..
-        "  Module Required: %d\n" ..
-        "  Bytecode Saved: %d\n" ..
-        "  Env Dumped: %d\n" ..
-        "  Debug Extracted: %d\n" ..
-        "  GC Recovered: %d\n" ..
+    SafeAppend(indexPath, string.format(
+        "\n" .. string.rep("=", 60) .. "\n" ..
+        "FINAL STATS:\n" ..
+        "  Total: %d (Local: %d, Server: %d, Module: %d)\n" ..
+        "  Success Rate: %d%%\n" ..
+        "  Decompiled: %d | Source: %d | Closure: %d | Module: %d\n" ..
+        "  Bytecode: %d | Env: %d | Debug: %d | GC: %d\n" ..
         "  Failed: %d\n" ..
-        "Date: %s\n\n" ..
-        string.rep("=", 60) .. "\n" ..
-        "FOLDER STRUCTURE:\n" ..
-        string.rep("=", 60) .. "\n\n",
-        gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
+        "  Files Written: %d\n",
+        scriptCount, localCount, serverCount, moduleCount,
         successRate,
         DecompileStats.decompiled, DecompileStats.source_prop,
         DecompileStats.closure_decompiled, DecompileStats.module_required,
         DecompileStats.bytecode_saved, DecompileStats.env_dumped,
         DecompileStats.debug_extracted, DecompileStats.gc_recovered,
-        DecompileStats.total_failed,
-        os.date("%Y-%m-%d %H:%M:%S")
-    )
-    
-    for folderKey, scripts in pairs(folderScripts) do
-        indexText = indexText .. "\n📁 " .. folderKey .. "/ (" .. #scripts .. " scripts)\n"
-        for i, s in ipairs(scripts) do
-            local icon = "✅"
-            if s.method == "failed" then icon = "❌"
-            elseif s.method == "fallback_composite" then icon = "⚠️" end
-            indexText = indexText .. "  " .. icon .. " " .. i .. ". [" .. s.class .. "] " .. s.name .. " (" .. s.method .. ")\n"
-            indexText = indexText .. "     Path: " .. s.path .. "\n"
-        end
-    end
-    
-    SafeWrite(ROOT .. "/INDEX.txt", indexText)
-    fileCount = fileCount + 1
+        DecompileStats.total_failed, fileCount
+    ))
     
     Log("=== SCRIPTS DUMP COMPLETE ===")
     Log(string.format("Found %d scripts (L:%d S:%d M:%d) | Success: %d%%",
         scriptCount, localCount, serverCount, moduleCount, successRate))
-    Log("Saved to: workspace/" .. ROOT)
     UpdateStatus("✅ " .. scriptCount .. " scripts | " .. successRate .. "% decompiled | " .. fileCount .. " files")
     
     DUMP_RUNNING = false
@@ -2301,7 +2151,6 @@ local function CreateGUI()
     Gui.ResetOnSpawn = false
     Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     
-    -- Main Frame
     local Main = Instance.new("Frame")
     Main.Name = "Main"
     Main.Size = UDim2.new(0.92, 0, 0.78, 0)
@@ -2315,7 +2164,6 @@ local function CreateGUI()
     stroke.Color = Color3.fromRGB(180, 50, 255)
     stroke.Thickness = 2
     
-    -- Title
     local Title = Instance.new("Frame")
     Title.Size = UDim2.new(1, 0, 0, 48)
     Title.BackgroundColor3 = Color3.fromRGB(25, 10, 55)
@@ -2341,7 +2189,6 @@ local function CreateGUI()
     TitleText.TextXAlignment = Enum.TextXAlignment.Left
     TitleText.Parent = Title
     
-    -- Minimize button
     local MinBtn = Instance.new("TextButton")
     MinBtn.Text = "—"
     MinBtn.Size = UDim2.new(0, 38, 0, 38)
@@ -2354,7 +2201,6 @@ local function CreateGUI()
     MinBtn.Parent = Title
     Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 8)
     
-    -- Close button
     local CloseBtn = Instance.new("TextButton")
     CloseBtn.Text = "✕"
     CloseBtn.Size = UDim2.new(0, 38, 0, 38)
@@ -2367,7 +2213,6 @@ local function CreateGUI()
     CloseBtn.Parent = Title
     Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
     
-    -- Content
     local Content = Instance.new("ScrollingFrame")
     Content.Size = UDim2.new(1, -16, 1, -56)
     Content.Position = UDim2.new(0, 8, 0, 52)
@@ -2383,7 +2228,6 @@ local function CreateGUI()
     Layout.SortOrder = Enum.SortOrder.LayoutOrder
     Layout.Parent = Content
     
-    -- Game info
     local gameInfo = Instance.new("TextLabel")
     gameInfo.Text = "🎮 Place: " .. game.PlaceId .. " | Game: " .. game.GameId
     gameInfo.Size = UDim2.new(1, 0, 0, 22)
@@ -2394,7 +2238,6 @@ local function CreateGUI()
     gameInfo.LayoutOrder = 1
     gameInfo.Parent = Content
     
-    -- Executor capabilities
     local capText = "🔧 "
     if HAS_DECOMPILE then capText = capText .. "decompile ✅ " else capText = capText .. "decompile ❌ " end
     if HAS_GETSENV then capText = capText .. "getsenv ✅ " else capText = capText .. "getsenv ❌ " end
@@ -2412,9 +2255,8 @@ local function CreateGUI()
     capLabel.LayoutOrder = 2
     capLabel.Parent = Content
     
-    -- Status
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Text = "⏸️ Ready - 10+ decompile layers active"
+    statusLabel.Text = "⏸️ Ready - Streaming Save Active"
     statusLabel.Size = UDim2.new(1, 0, 0, 28)
     statusLabel.BackgroundColor3 = Color3.fromRGB(20, 30, 20)
     statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
@@ -2424,7 +2266,6 @@ local function CreateGUI()
     statusLabel.Parent = Content
     Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 6)
     
-    -- Progress
     progressLabel = Instance.new("TextLabel")
     progressLabel.Text = "Inst: 0 | Scripts: 0 | Assets: 0 | Files: 0 | OK: 0 | Fail: 0"
     progressLabel.Size = UDim2.new(1, 0, 0, 18)
@@ -2436,7 +2277,6 @@ local function CreateGUI()
     progressLabel.LayoutOrder = 4
     progressLabel.Parent = Content
     
-    -- Helper function for buttons
     local function MakeButton(text, color, order)
         local btn = Instance.new("TextButton")
         btn.Text = text
@@ -2452,14 +2292,12 @@ local function CreateGUI()
         return btn
     end
     
-    -- Buttons
-    local DumpAllBtn = MakeButton("⬇️ RIP EVERYTHING (10+ Layer Decompile)", Color3.fromRGB(140, 20, 220), 10)
-    local ScriptsDeepBtn = MakeButton("📜 SCRIPTS ONLY (Maximum Extraction)", Color3.fromRGB(220, 100, 0), 11)
-    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx) - Advanced Options", Color3.fromRGB(200, 80, 30), 12)
+    local DumpAllBtn = MakeButton("⬇️ RIP EVERYTHING (Streaming Save)", Color3.fromRGB(140, 20, 220), 10)
+    local ScriptsDeepBtn = MakeButton("📜 SCRIPTS ONLY (Streaming Save)", Color3.fromRGB(220, 100, 0), 11)
+    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx)", Color3.fromRGB(200, 80, 30), 12)
     local ClipboardBtn = MakeButton("📋 COPY ALL SCRIPTS TO CLIPBOARD", Color3.fromRGB(30, 130, 80), 13)
     local TreeOnlyBtn = MakeButton("🌳 EXPORT TREE STRUCTURE ONLY", Color3.fromRGB(30, 80, 150), 14)
     
-    -- Separator
     local sep = Instance.new("Frame")
     sep.Size = UDim2.new(0.9, 0, 0, 1)
     sep.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
@@ -2467,10 +2305,9 @@ local function CreateGUI()
     sep.LayoutOrder = 15
     sep.Parent = Content
     
-    -- Info labels
     local locInfo = Instance.new("TextLabel")
-    locInfo.Text = "📁 Output: /sdcard/[Executor]/workspace/MapRip/\n🔥 10+ fallback layers: source→decompile→closure→getsenv→require→bytecode→debug→gc"
-    locInfo.Size = UDim2.new(1, 0, 0, 45)
+    locInfo.Text = "📁 Output: /sdcard/[Executor]/workspace/MapRip/\n🔥 STREAMING: file langsung tersedia tanpa tunggu selesai!"
+    locInfo.Size = UDim2.new(1, 0, 0, 40)
     locInfo.BackgroundColor3 = Color3.fromRGB(25, 20, 40)
     locInfo.TextColor3 = Color3.fromRGB(255, 190, 70)
     locInfo.TextSize = 9
@@ -2480,9 +2317,8 @@ local function CreateGUI()
     locInfo.Parent = Content
     Instance.new("UICorner", locInfo).CornerRadius = UDim.new(0, 6)
     
-    -- Log box
     logBox = Instance.new("TextLabel")
-    logBox.Text = "[Ready] v4.0 OP Edition loaded\n"
+    logBox.Text = "[Ready] v4.0 OP + Streaming Save\n"
     logBox.Size = UDim2.new(1, 0, 0, 280)
     logBox.BackgroundColor3 = Color3.fromRGB(8, 8, 16)
     logBox.TextColor3 = Color3.fromRGB(120, 255, 120)
@@ -2500,7 +2336,7 @@ local function CreateGUI()
     lp.PaddingLeft = UDim.new(0, 4)
     lp.PaddingRight = UDim.new(0, 4)
     
-    -- ===== DRAGGING =====
+    -- Dragging
     local dragging, dragStart, startPos = false, nil, nil
     
     Title.InputBegan:Connect(function(input)
@@ -2524,7 +2360,7 @@ local function CreateGUI()
         end
     end)
     
-    -- ===== BUTTON HANDLERS =====
+    -- Button Handlers
     CloseBtn.MouseButton1Click:Connect(function() Gui:Destroy() end)
     
     local minimized = false
@@ -2537,30 +2373,28 @@ local function CreateGUI()
     
     DumpAllBtn.MouseButton1Click:Connect(function()
         if DUMP_RUNNING then return end
-        DumpAllBtn.Text = "⏳ RIPPING MAP (10+ layers)..."
+        DumpAllBtn.Text = "⏳ RIPPING (streaming save)..."
         DumpAllBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        
         task.spawn(function()
             local folder = DumpEverything()
-            DumpAllBtn.Text = "✅ DONE! " .. totalFiles .. " files → workspace/" .. (folder or "MapRip")
+            DumpAllBtn.Text = "✅ DONE! " .. totalFiles .. " files"
             DumpAllBtn.BackgroundColor3 = Color3.fromRGB(30, 160, 30)
             task.wait(5)
-            DumpAllBtn.Text = "⬇️ RIP EVERYTHING (10+ Layer Decompile)"
+            DumpAllBtn.Text = "⬇️ RIP EVERYTHING (Streaming Save)"
             DumpAllBtn.BackgroundColor3 = Color3.fromRGB(140, 20, 220)
         end)
     end)
     
     ScriptsDeepBtn.MouseButton1Click:Connect(function()
         if DUMP_RUNNING then return end
-        ScriptsDeepBtn.Text = "⏳ EXTRACTING ALL SCRIPTS..."
+        ScriptsDeepBtn.Text = "⏳ EXTRACTING (streaming)..."
         ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        
         task.spawn(function()
             local folder, count, files, rate = ScriptsOnlyDump()
-            ScriptsDeepBtn.Text = string.format("✅ %d scripts | %d%% decompiled!", count or 0, rate or 0)
+            ScriptsDeepBtn.Text = string.format("✅ %d scripts | %d%%", count or 0, rate or 0)
             ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(30, 160, 30)
             task.wait(5)
-            ScriptsDeepBtn.Text = "📜 SCRIPTS ONLY (Maximum Extraction)"
+            ScriptsDeepBtn.Text = "📜 SCRIPTS ONLY (Streaming Save)"
             ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(220, 100, 0)
         end)
     end)
@@ -2570,71 +2404,48 @@ local function CreateGUI()
             Log("❌ saveinstance not supported!")
             SaveInstanceBtn.Text = "❌ NOT SUPPORTED"
             task.wait(2)
-            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - Advanced Options"
+            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx)"
             return
         end
-        
-        SaveInstanceBtn.Text = "⏳ SAVING (Full Options)..."
+        SaveInstanceBtn.Text = "⏳ SAVING..."
         task.spawn(function()
-            local gameName, gameId = GetGameInfo()
+            local gn, gi = GetGameInfo()
             local ok, err = pcall(function()
                 saveinstance({
-                    FilePath = "MapRip/" .. gameName .. "_" .. gameId .. "_FULL.rbxlx",
-                    Decompile = true,
-                    DecompileTimeout = 30,
-                    NilInstances = true,
-                    RemovePlayerCharacters = true,
-                    ExcludePlayerCharacter = true,
-                    ExcludePlayerGui = false,
-                    IsolateStarterPlayer = false,
-                    ShowStatus = true,
-                    SaveBytecode = true,
-                    mode = "full",
+                    FilePath = "MapRip/" .. gn .. "_" .. gi .. "_FULL.rbxlx",
+                    Decompile = true, DecompileTimeout = 30,
+                    NilInstances = true, RemovePlayerCharacters = true,
+                    ExcludePlayerCharacter = true, ExcludePlayerGui = false,
+                    ShowStatus = true, SaveBytecode = true, mode = "full",
                 })
             end)
-            if ok then
-                SaveInstanceBtn.Text = "✅ SAVED .rbxlx (Full + Bytecode)!"
-                Log("Full .rbxlx saved with bytecode fallback!")
-            else
-                SaveInstanceBtn.Text = "❌ Error: " .. tostring(err):sub(1, 40)
-                Log("saveinstance error: " .. tostring(err))
-            end
+            SaveInstanceBtn.Text = ok and "✅ SAVED!" or ("❌ " .. tostring(err):sub(1, 40))
             task.wait(3)
-            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - Advanced Options"
+            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx)"
         end)
     end)
     
     ClipboardBtn.MouseButton1Click:Connect(function()
-        ClipboardBtn.Text = "⏳ COLLECTING (All layers)..."
+        ClipboardBtn.Text = "⏳ COLLECTING..."
         task.spawn(function()
             local allScripts = DiscoverAllScripts()
             local all = {}
             local count = 0
-            
             for _, entry in ipairs(allScripts) do
                 local obj = entry.instance
                 count = count + 1
-                local decompResult = UltimateDecompile(obj)
-                all[#all+1] = "\n" .. string.rep("=", 60) .. "\n-- [" .. count .. "] " .. obj:GetFullName() .. "\n-- Class: " .. obj.ClassName .. "\n-- Method: " .. decompResult.method .. "\n" .. string.rep("=", 60) .. "\n" .. (decompResult.source or "-- EMPTY")
-                
+                local dr = UltimateDecompile(obj)
+                all[#all+1] = "\n" .. string.rep("=", 60) .. "\n-- [" .. count .. "] " .. obj:GetFullName() .. "\n-- Class: " .. obj.ClassName .. "\n-- Method: " .. dr.method .. "\n" .. string.rep("=", 60) .. "\n" .. (dr.source or "-- EMPTY")
                 if count % 5 == 0 then task.wait(0.1) end
             end
-            
-            local text = "-- TOTAL SCRIPTS: " .. count .. "\n-- Extracted with ULTIMATE MAP RIPPER v4.0\n" .. table.concat(all, "\n")
-            
-            if setclipboard then
-                setclipboard(text)
-                ClipboardBtn.Text = "✅ COPIED! (" .. count .. " scripts)"
-            elseif toclipboard then
-                toclipboard(text)
-                ClipboardBtn.Text = "✅ COPIED! (" .. count .. " scripts)"
+            local text = "-- TOTAL: " .. count .. "\n" .. table.concat(all, "\n")
+            if setclipboard then setclipboard(text)
+            elseif toclipboard then toclipboard(text)
             else
-                local gameName, gameId = GetGameInfo()
                 MakeFolder("MapRip")
-                SafeWrite("MapRip/clipboard_" .. gameName .. ".lua", text)
-                ClipboardBtn.Text = "✅ SAVED TO FILE (" .. count .. " scripts)"
+                SafeWrite("MapRip/clipboard_dump.lua", text)
             end
-            
+            ClipboardBtn.Text = "✅ " .. count .. " scripts copied!"
             task.wait(4)
             ClipboardBtn.Text = "📋 COPY ALL SCRIPTS TO CLIPBOARD"
         end)
@@ -2643,53 +2454,37 @@ local function CreateGUI()
     TreeOnlyBtn.MouseButton1Click:Connect(function()
         TreeOnlyBtn.Text = "⏳ MAPPING..."
         task.spawn(function()
-            local gameName, gameId = GetGameInfo()
+            local gn, _ = GetGameInfo()
             local lines = {}
             local count = 0
-            
             local function MapTree(inst, depth)
                 count = count + 1
-                local indent = string.rep("│ ", depth)
-                lines[#lines+1] = indent .. "├─ [" .. inst.ClassName .. "] " .. inst.Name
+                lines[#lines+1] = string.rep("│ ", depth) .. "├─ [" .. inst.ClassName .. "] " .. inst.Name
                 pcall(function()
-                    for _, child in ipairs(inst:GetChildren()) do
-                        MapTree(child, depth + 1)
-                    end
+                    for _, child in ipairs(inst:GetChildren()) do MapTree(child, depth + 1) end
                 end)
                 if count % 500 == 0 then task.wait() end
             end
-            
-            local svcList = {Workspace, ReplicatedStorage, ReplicatedFirst, Lighting, StarterGui, StarterPack, StarterPlayer, SoundService}
-            local svcNames = {"Workspace", "ReplicatedStorage", "ReplicatedFirst", "Lighting", "StarterGui", "StarterPack", "StarterPlayer", "SoundService"}
-            
-            for i, svc in ipairs(svcList) do
-                lines[#lines+1] = "\n" .. string.rep("=", 50) .. "\n" .. svcNames[i] .. "\n" .. string.rep("=", 50)
-                pcall(function()
-                    for _, child in ipairs(svc:GetChildren()) do
-                        MapTree(child, 1)
-                    end
-                end)
+            local svcs = {Workspace, ReplicatedStorage, ReplicatedFirst, Lighting, StarterGui, StarterPack, StarterPlayer, SoundService}
+            local names = {"Workspace", "ReplicatedStorage", "ReplicatedFirst", "Lighting", "StarterGui", "StarterPack", "StarterPlayer", "SoundService"}
+            for i, svc in ipairs(svcs) do
+                lines[#lines+1] = "\n" .. string.rep("=", 50) .. "\n" .. names[i] .. "\n" .. string.rep("=", 50)
+                pcall(function() for _, c in ipairs(svc:GetChildren()) do MapTree(c, 1) end end)
             end
-            
             MakeFolder("MapRip")
-            SafeWrite("MapRip/TREE_" .. gameName .. ".txt", "INSTANCES: " .. count .. "\n\n" .. table.concat(lines, "\n"))
-            TreeOnlyBtn.Text = "✅ TREE SAVED! (" .. count .. " instances)"
-            Log("Tree exported: " .. count .. " instances")
+            SafeWrite("MapRip/TREE_" .. gn .. ".txt", "INSTANCES: " .. count .. "\n\n" .. table.concat(lines, "\n"))
+            TreeOnlyBtn.Text = "✅ " .. count .. " instances"
             task.wait(3)
             TreeOnlyBtn.Text = "🌳 EXPORT TREE STRUCTURE ONLY"
         end)
     end)
     
-    -- Parent GUI
     local ok = pcall(function() Gui.Parent = game:GetService("CoreGui") end)
     if not ok then Gui.Parent = LocalPlayer.PlayerGui end
     
     Log("GUI Ready! Game: " .. game.PlaceId)
-    Log("Executor APIs detected:")
-    Log("  decompile: " .. tostring(HAS_DECOMPILE))
-    Log("  getsenv: " .. tostring(HAS_GETSENV))
-    Log("  bytecode: " .. tostring(HAS_GETSCRIPTBYTECODE))
-    Log("  nil/running/gc: " .. tostring(HAS_GETNILINSTANCES) .. "/" .. tostring(HAS_GETRUNNINGSCRIPTS) .. "/" .. tostring(HAS_GETGC))
+    Log("Mode: STREAMING SAVE (file langsung tersedia)")
+    Log("APIs: decompile=" .. tostring(HAS_DECOMPILE) .. " getsenv=" .. tostring(HAS_GETSENV) .. " bytecode=" .. tostring(HAS_GETSCRIPTBYTECODE))
     return Gui
 end
 
