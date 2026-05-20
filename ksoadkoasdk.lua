@@ -414,12 +414,80 @@ local TeleCtrl = tryRequire({"Modules", "ControllerLoader", "TeleportController"
 local Network = tryRequire({"Shared", "Packages", "Network"})
 
 -- ═══════════════════════════════════════
+-- NETWORK REMOTES (from capture analysis)
+-- Path: ReplicatedStorage.Shared.Packages.Network
+-- Server→Client (rev_ prefix): rev_KickEvent, rev_IndexUpdate, rev_Collected, rev_KickEventEnded
+-- Client→Server: Look for RemoteEvents without rev_ prefix
+-- ═══════════════════════════════════════
+local NetworkFolder = RS:FindFirstChild("Shared") and RS.Shared:FindFirstChild("Packages") and RS.Shared.Packages:FindFirstChild("Network")
+local Remotes = {}
+
+-- Scan all remotes in Network folder
+if NetworkFolder then
+    for _, child in pairs(NetworkFolder:GetChildren()) do
+        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") or child:IsA("UnreliableRemoteEvent") then
+            Remotes[child.Name] = child
+        end
+    end
+end
+
+-- Also scan other common locations
+for _, folder in pairs({RS, RS:FindFirstChild("Remotes"), RS:FindFirstChild("Events")}) do
+    if folder then
+        for _, child in pairs(folder:GetChildren()) do
+            if (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) and not Remotes[child.Name] then
+                Remotes[child.Name] = child
+            end
+        end
+    end
+end
+
+-- ═══════════════════════════════════════
 -- CORE FUNCTIONS
 -- ═══════════════════════════════════════
 
+--[[
+    NETWORK PROTOCOL (dari manual capture):
+    Path: ReplicatedStorage.Shared.Packages.Network
+    
+    SERVER → CLIENT (prefix "rev_"):
+    - rev_KickEvent: (distance: number, {Name: string, Mutation: string})
+    - rev_IndexUpdate: (brainrotName: string, mutation: string)
+    - rev_Collected: (brainrotName: string)
+    - rev_KickEventEnded: (success: boolean)
+    
+    CLIENT → SERVER: RemoteEvents tanpa prefix "rev_" di folder Network
+    
+    FLOW:
+    1. Client fires kick remote → server processes
+    2. Server fires rev_KickEvent (brainrot spawns di dunia)
+    3. Player harus "touch"/collect brainrot yg spawn
+    4. Server fires rev_Collected (confirmed collected)
+    5. Server fires rev_KickEventEnded (round done)
+]]
+
+-- Scan Network folder for client→server remotes
+local kickRemote, collectRemote, placeRemote, upgradeRemote
+if NetworkFolder then
+    for _, child in pairs(NetworkFolder:GetChildren()) do
+        if child:IsA("RemoteEvent") and not child.Name:find("^rev_") then
+            local n = child.Name:lower()
+            if n:find("kick") and not kickRemote then kickRemote = child end
+            if (n:find("collect") or n:find("claim")) and not collectRemote then collectRemote = child end
+            if n:find("place") and not placeRemote then placeRemote = child end
+            if n:find("upgrade") and not upgradeRemote then upgradeRemote = child end
+        end
+    end
+end
+
 -- Auto Kick
 local function doKick()
-    -- Method 1: KickController
+    -- Method 1: Direct kick remote from Network folder (BEST)
+    if kickRemote then
+        pcall(function() kickRemote:FireServer() end)
+        return
+    end
+    -- Method 2: KickController
     if KickCtrl and KickCtrl.PerformKick then
         pcall(function()
             KickCtrl.TravelRatio = 1
@@ -428,14 +496,15 @@ local function doKick()
         end)
         return
     end
-    -- Method 2: Network
-    if Network then
+    -- Method 3: Network module
+    if Network and Network.FireServer then
         pcall(function() Network.FireServer("Kick") end)
+        return
     end
-    -- Method 3: Find and fire kick remotes
+    -- Method 4: Scan all remotes
     pcall(function()
         for _, r in pairs(RS:GetDescendants()) do
-            if r:IsA("RemoteEvent") and r.Name:lower():find("kick") then
+            if r:IsA("RemoteEvent") and r.Name:lower():find("kick") and not r.Name:find("rev_") then
                 r:FireServer()
                 break
             end
@@ -448,35 +517,42 @@ local function doCollect()
     local _, _, hrp = getChar()
     if not hrp then return end
     
-    -- Touch all tagged entities
+    -- Method 1: Fire collect remote directly (BEST)
+    if collectRemote then
+        pcall(function() collectRemote:FireServer() end)
+    end
+    
+    -- Method 2: Network module
+    if Network and Network.FireServer then
+        pcall(function() Network.FireServer("Collect") end)
+        pcall(function() Network.FireServer("Claim") end)
+    end
+    
+    -- Method 3: Touch entities via firetouchinterest
     pcall(function()
         for _, tag in pairs({"EntityTool", "LuckyBlockTool", "Entity", "Brainrot"}) do
             for _, obj in pairs(CollectionService:GetTagged(tag)) do
                 local part = obj:IsA("BasePart") and obj or (obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")))
-                if part and (part.Position - hrp.Position).Magnitude < 200 then
+                if part and hrp and (part.Position - hrp.Position).Magnitude < 300 then
                     tp(part.Position + Vector3.new(0, 2, 0))
-                    task.wait(0.1)
-                    pcall(function()
-                        if firetouchinterest then
-                            firetouchinterest(hrp, part, 0)
-                            task.wait(0.05)
-                            firetouchinterest(hrp, part, 1)
-                        end
-                    end)
+                    task.wait(0.05)
+                    if firetouchinterest then
+                        firetouchinterest(hrp, part, 0)
+                        task.wait(0.02)
+                        firetouchinterest(hrp, part, 1)
+                    end
                 end
             end
         end
     end)
     
-    -- Fire proximity prompts nearby
+    -- Method 4: Proximity prompts
     pcall(function()
         for _, obj in pairs(workspace:GetDescendants()) do
             if obj:IsA("ProximityPrompt") and obj.Enabled then
                 local promPart = obj.Parent
-                if promPart and promPart:IsA("BasePart") and (promPart.Position - hrp.Position).Magnitude < 50 then
-                    if fireproximityprompt then
-                        fireproximityprompt(obj)
-                    end
+                if promPart and promPart:IsA("BasePart") and hrp and (promPart.Position - hrp.Position).Magnitude < 100 then
+                    if fireproximityprompt then fireproximityprompt(obj) end
                 end
             end
         end
@@ -508,14 +584,27 @@ end
 
 -- Place Brainrot
 local function doPlace()
+    -- Method 1: Direct place remote
+    if placeRemote then
+        pcall(function() placeRemote:FireServer() end)
+        return
+    end
+    -- Method 2: Network module
     pcall(function()
-        if Network then
+        if Network and Network.FireServer then
             Network.FireServer("PlaceBrainrot")
             Network.FireServer("Place")
         end
-        for _, r in pairs(RS:GetDescendants()) do
-            if r:IsA("RemoteEvent") and (r.Name:lower():find("place") or r.Name:lower():find("slot")) then
-                r:FireServer()
+    end)
+    -- Method 3: Scan remotes
+    pcall(function()
+        if NetworkFolder then
+            for _, child in pairs(NetworkFolder:GetChildren()) do
+                if child:IsA("RemoteEvent") and not child.Name:find("^rev_") then
+                    if child.Name:lower():find("place") or child.Name:lower():find("slot") then
+                        child:FireServer()
+                    end
+                end
             end
         end
     end)
@@ -523,15 +612,27 @@ end
 
 -- Upgrade Kick
 local function doUpgradeKick()
+    -- Method 1: Direct upgrade remote
+    if upgradeRemote then
+        pcall(function() upgradeRemote:FireServer() end)
+        return
+    end
+    -- Method 2: Network module
     pcall(function()
-        if Network then
+        if Network and Network.FireServer then
             Network.FireServer("UpgradeKick")
             Network.FireServer("BuyKickUpgrade")
         end
-        for _, r in pairs(RS:GetDescendants()) do
-            if (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) and r.Name:lower():find("upgrade") and r.Name:lower():find("kick") then
-                if r:IsA("RemoteEvent") then r:FireServer()
-                else pcall(function() r:InvokeServer() end) end
+    end)
+    -- Method 3: Scan
+    pcall(function()
+        if NetworkFolder then
+            for _, child in pairs(NetworkFolder:GetChildren()) do
+                if child:IsA("RemoteEvent") and not child.Name:find("^rev_") then
+                    if child.Name:lower():find("upgrade") then
+                        child:FireServer()
+                    end
+                end
             end
         end
     end)
@@ -743,11 +844,24 @@ createSeparator(pageInfo, "DEBUG")
 createButton(pageInfo, "📡 Scan All Remotes", function()
     local count = 0
     local list = ""
+    -- Prioritize Network folder
+    if NetworkFolder then
+        list = list .. "=== Network Folder ===\n"
+        for _, r in pairs(NetworkFolder:GetChildren()) do
+            if r:IsA("RemoteEvent") or r:IsA("RemoteFunction") or r:IsA("UnreliableRemoteEvent") then
+                count = count + 1
+                local prefix = r.Name:find("^rev_") and "[S→C]" or "[C→S]"
+                list = list .. prefix .. " " .. r.Name .. "\n"
+            end
+        end
+    end
+    -- Then all others
+    list = list .. "\n=== Other Remotes ===\n"
     for _, r in pairs(RS:GetDescendants()) do
-        if r:IsA("RemoteEvent") or r:IsA("RemoteFunction") then
+        if (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) and r.Parent ~= NetworkFolder then
             count = count + 1
-            if count <= 20 then
-                list = list .. r.Name .. "\n"
+            if count <= 30 then
+                list = list .. r.Name .. " (" .. r.Parent.Name .. ")\n"
             end
         end
     end
@@ -755,19 +869,27 @@ createButton(pageInfo, "📡 Scan All Remotes", function()
 end)
 createButton(pageInfo, "🔍 Show Game Modules", function()
     local info = ""
-    info = info .. "KickService: " .. (KickService and "✓" or "✗") .. "\n"
-    info = info .. "BalanceService: " .. (BalanceService and "✓" or "✗") .. "\n"
-    info = info .. "WheelService: " .. (WheelService and "✓" or "✗") .. "\n"
-    info = info .. "LuckService: " .. (LuckService and "✓" or "✗") .. "\n"
-    info = info .. "KickCtrl: " .. (KickCtrl and "✓" or "✗") .. "\n"
-    info = info .. "TeleCtrl: " .. (TeleCtrl and "✓" or "✗") .. "\n"
-    info = info .. "Network: " .. (Network and "✓" or "✗") .. "\n"
+    info = info .. "=== Services ===\n"
+    info = info .. "KickService: " .. (KickService and "OK" or "X") .. "\n"
+    info = info .. "BalanceService: " .. (BalanceService and "OK" or "X") .. "\n"
+    info = info .. "WheelService: " .. (WheelService and "OK" or "X") .. "\n"
+    info = info .. "LuckService: " .. (LuckService and "OK" or "X") .. "\n"
+    info = info .. "KickCtrl: " .. (KickCtrl and "OK" or "X") .. "\n"
+    info = info .. "TeleCtrl: " .. (TeleCtrl and "OK" or "X") .. "\n"
+    info = info .. "Network: " .. (Network and "OK" or "X") .. "\n"
+    info = info .. "NetworkFolder: " .. (NetworkFolder and "OK" or "X") .. "\n"
+    info = info .. "\n=== Detected Remotes ===\n"
+    info = info .. "Kick: " .. (kickRemote and kickRemote.Name or "NOT FOUND") .. "\n"
+    info = info .. "Collect: " .. (collectRemote and collectRemote.Name or "NOT FOUND") .. "\n"
+    info = info .. "Place: " .. (placeRemote and placeRemote.Name or "NOT FOUND") .. "\n"
+    info = info .. "Upgrade: " .. (upgradeRemote and upgradeRemote.Name or "NOT FOUND") .. "\n"
     if KickService then
-        info = info .. "\nKick Level: " .. tostring(KickService.Level)
-        info = info .. "\nKick %: " .. tostring(KickService.Percent)
+        info = info .. "\n=== Stats ===\n"
+        info = info .. "Kick Lvl: " .. tostring(KickService.Level) .. "\n"
+        info = info .. "Kick %: " .. tostring(KickService.Percent) .. "\n"
     end
-    if BalanceService then
-        info = info .. "\nCoins: " .. tostring(BalanceService.Balance.first) .. "e" .. tostring(BalanceService.Balance.second)
+    if BalanceService and BalanceService.Balance then
+        info = info .. "Coins: " .. tostring(BalanceService.Balance.first) .. "e" .. tostring(BalanceService.Balance.second) .. "\n"
     end
     statusLabel.Text = info
 end)
@@ -789,15 +911,13 @@ switchPage("Farm")
 task.spawn(function()
     while ScreenGui.Parent do
         if States.AutoFarm then
-            -- Full cycle: Kick → Wait → Collect → Teleport → Place
+            -- CORRECT FLOW: Kick → Brainrot spawns → Teleport to Base → Brainrot masuk kantong
             doKick()
             task.wait(SETTINGS.KickDelay)
-            task.wait(SETTINGS.CollectWait)
-            doCollect()
-            task.wait(0.3)
-            doTeleportBase()
-            task.wait(0.5)
-            doPlace()
+            task.wait(SETTINGS.CollectWait) -- Tunggu brainrot spawn
+            doTeleportBase()              -- Lari ke base = brainrot auto masuk kantong
+            task.wait(0.8)                -- Tunggu collected
+            doCollect()                   -- Backup: trigger collect jika perlu
             task.wait(0.3)
         elseif States.AutoKick then
             doKick()
@@ -824,8 +944,6 @@ task.spawn(function()
     while ScreenGui.Parent do
         if States.AutoTeleport and not States.AutoFarm then
             doTeleportBase()
-            task.wait(0.5)
-            doPlace()
         end
         task.wait(3)
     end
