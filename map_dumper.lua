@@ -821,7 +821,7 @@ local function CreateGUI()
     Content.BorderSizePixel = 0
     Content.ScrollBarThickness = 4
     Content.ScrollBarImageColor3 = Color3.fromRGB(130, 50, 255)
-    Content.CanvasSize = UDim2.new(0, 0, 0, 750)
+    Content.CanvasSize = UDim2.new(0, 0, 0, 850)
     Content.Parent = Main
     
     local Layout = Instance.new("UIListLayout")
@@ -881,16 +881,17 @@ local function CreateGUI()
     
     -- Buttons
     local DumpAllBtn = MakeButton("⬇️ RIP EVERYTHING (Semua tanpa pengecualian)", Color3.fromRGB(130, 30, 200), 10)
-    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx) - If Supported", Color3.fromRGB(200, 100, 30), 11)
-    local ClipboardBtn = MakeButton("📋 COPY ALL SCRIPTS TO CLIPBOARD", Color3.fromRGB(30, 130, 80), 12)
-    local TreeOnlyBtn = MakeButton("🌳 EXPORT TREE STRUCTURE ONLY", Color3.fromRGB(30, 80, 150), 13)
+    local ScriptsDeepBtn = MakeButton("📜 SCRIPTS ONLY (Logic Game, Skip Assets)", Color3.fromRGB(220, 120, 0), 11)
+    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx) - If Supported", Color3.fromRGB(200, 100, 30), 12)
+    local ClipboardBtn = MakeButton("📋 COPY ALL SCRIPTS TO CLIPBOARD", Color3.fromRGB(30, 130, 80), 13)
+    local TreeOnlyBtn = MakeButton("🌳 EXPORT TREE STRUCTURE ONLY", Color3.fromRGB(30, 80, 150), 14)
     
     -- Separator
     local sep = Instance.new("Frame")
     sep.Size = UDim2.new(0.9, 0, 0, 1)
     sep.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
     sep.BorderSizePixel = 0
-    sep.LayoutOrder = 14
+    sep.LayoutOrder = 15
     sep.Parent = Content
     
     -- Location info
@@ -902,7 +903,7 @@ local function CreateGUI()
     locInfo.TextSize = 10
     locInfo.Font = Enum.Font.Gotham
     locInfo.TextWrapped = true
-    locInfo.LayoutOrder = 15
+    locInfo.LayoutOrder = 16
     locInfo.Parent = Content
     Instance.new("UICorner", locInfo).CornerRadius = UDim.new(0, 6)
     
@@ -918,7 +919,7 @@ local function CreateGUI()
     logBox.TextXAlignment = Enum.TextXAlignment.Left
     logBox.TextYAlignment = Enum.TextYAlignment.Top
     logBox.BorderSizePixel = 0
-    logBox.LayoutOrder = 16
+    logBox.LayoutOrder = 17
     logBox.Parent = Content
     Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
     local lp = Instance.new("UIPadding", logBox)
@@ -973,6 +974,250 @@ local function CreateGUI()
             task.wait(5)
             DumpAllBtn.Text = "⬇️ RIP EVERYTHING (Semua tanpa pengecualian)"
             DumpAllBtn.BackgroundColor3 = Color3.fromRGB(130, 30, 200)
+        end)
+    end)
+    
+    -- ===== SCRIPTS ONLY DEEP DUMP (Skip all assets, only grab logic/code) =====
+    ScriptsDeepBtn.MouseButton1Click:Connect(function()
+        if DUMP_RUNNING then return end
+        DUMP_RUNNING = true
+        ScriptsDeepBtn.Text = "⏳ EXTRACTING SCRIPTS..."
+        ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        
+        task.spawn(function()
+            local gameName, gameId = GetGameInfo()
+            local ROOT = "MapRip/" .. gameName .. "_" .. gameId .. "_SCRIPTS_ONLY"
+            MakeFolder(ROOT)
+            MakeFolder(ROOT .. "/LocalScripts")
+            MakeFolder(ROOT .. "/ServerScripts")
+            MakeFolder(ROOT .. "/ModuleScripts")
+            MakeFolder(ROOT .. "/ByFolder")
+            
+            local scriptCount = 0
+            local localCount = 0
+            local serverCount = 0
+            local moduleCount = 0
+            local fileCount = 0
+            local scannedInstances = 0
+            
+            -- Organized by parent folder path
+            local folderScripts = {} -- [folderPath] = {scripts...}
+            
+            Log("=== SCRIPTS ONLY DUMP ===")
+            Log("Skipping: Sound, Texture, Decal, Image, MeshPart geometry, Particles, etc")
+            Log("Grabbing: ALL LocalScript, Script, ModuleScript")
+            UpdateStatus("Scanning for scripts...")
+            
+            local allServices = {
+                {Workspace, "Workspace"},
+                {ReplicatedStorage, "ReplicatedStorage"},
+                {ReplicatedFirst, "ReplicatedFirst"},
+                {Lighting, "Lighting"},
+                {StarterGui, "StarterGui"},
+                {StarterPack, "StarterPack"},
+                {StarterPlayer, "StarterPlayer"},
+                {SoundService, "SoundService"},
+                {Teams, "Teams"},
+            }
+            pcall(function() table.insert(allServices, {game:GetService("Chat"), "Chat"}) end)
+            pcall(function() table.insert(allServices, {LocalPlayer.PlayerGui, "PlayerGui"}) end)
+            pcall(function() table.insert(allServices, {LocalPlayer.PlayerScripts, "PlayerScripts"}) end)
+            pcall(function() table.insert(allServices, {LocalPlayer.Backpack, "Backpack"}) end)
+            
+            for _, svcInfo in ipairs(allServices) do
+                local container, svcName = svcInfo[1], svcInfo[2]
+                UpdateStatus("Scanning: " .. svcName)
+                
+                pcall(function()
+                    local descendants = container:GetDescendants()
+                    for _, obj in ipairs(descendants) do
+                        scannedInstances = scannedInstances + 1
+                        
+                        if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
+                            scriptCount = scriptCount + 1
+                            
+                            local source = DecompileScript(obj)
+                            local name = SafeName(obj.Name)
+                            local fullPath = obj:GetFullName()
+                            local parentPath = SafeName(obj.Parent and obj.Parent:GetFullName() or "Unknown")
+                            
+                            -- Determine type
+                            local folder = "ServerScripts"
+                            local ext = ".server.lua"
+                            local typeLabel = "Server"
+                            
+                            if obj:IsA("LocalScript") then
+                                folder = "LocalScripts"
+                                ext = ".client.lua"
+                                typeLabel = "Local"
+                                localCount = localCount + 1
+                            elseif obj:IsA("ModuleScript") then
+                                folder = "ModuleScripts"
+                                ext = ".module.lua"
+                                typeLabel = "Module"
+                                moduleCount = moduleCount + 1
+                            else
+                                serverCount = serverCount + 1
+                            end
+                            
+                            -- Header with full context
+                            local header = string.format(
+                                "-- ============================================================\n" ..
+                                "-- SCRIPT: %s\n" ..
+                                "-- TYPE: %s (%s)\n" ..
+                                "-- PATH: %s\n" ..
+                                "-- PARENT: %s [%s]\n" ..
+                                "-- SERVICE: %s\n" ..
+                                "-- ENABLED: %s\n" ..
+                                "-- ============================================================\n\n",
+                                obj.Name,
+                                typeLabel, obj.ClassName,
+                                fullPath,
+                                obj.Parent and obj.Parent.Name or "nil",
+                                obj.Parent and obj.Parent.ClassName or "nil",
+                                svcName,
+                                tostring(pcall(function() return obj.Enabled end) and (obj.Enabled ~= false) or "N/A")
+                            )
+                            
+                            -- Save individually by type
+                            local fileName = string.format("%04d", scriptCount) .. "_" .. name .. ext
+                            SafeWrite(ROOT .. "/" .. folder .. "/" .. fileName, header .. source)
+                            fileCount = fileCount + 1
+                            
+                            -- Also organize by parent folder
+                            local folderKey = SafeName(svcName .. "/" .. (obj.Parent and obj.Parent.Name or "root"))
+                            if not folderScripts[folderKey] then
+                                folderScripts[folderKey] = {}
+                            end
+                            table.insert(folderScripts[folderKey], {
+                                name = obj.Name,
+                                class = obj.ClassName,
+                                path = fullPath,
+                                source = source,
+                                header = header,
+                            })
+                            
+                            Log("[" .. typeLabel .. "] " .. obj.Name .. " ← " .. svcName)
+                            
+                            if scriptCount % 20 == 0 then
+                                UpdateProgress()
+                                task.wait()
+                            end
+                        end
+                        
+                        if scannedInstances % 300 == 0 then
+                            task.wait()
+                        end
+                    end
+                end)
+            end
+            
+            -- Save organized by folder
+            UpdateStatus("Saving by folder structure...")
+            for folderKey, scripts in pairs(folderScripts) do
+                local folderPath = ROOT .. "/ByFolder/" .. folderKey
+                MakeFolder(folderPath)
+                
+                for i, s in ipairs(scripts) do
+                    local ext = ".lua"
+                    if s.class == "LocalScript" then ext = ".client.lua"
+                    elseif s.class == "ModuleScript" then ext = ".module.lua"
+                    else ext = ".server.lua" end
+                    
+                    local fn = SafeName(s.name) .. "_" .. i .. ext
+                    SafeWrite(folderPath .. "/" .. fn, s.header .. s.source)
+                    fileCount = fileCount + 1
+                end
+            end
+            
+            -- Save combined file (all scripts in 1 file)
+            UpdateStatus("Saving combined file...")
+            local combined = string.format(
+                "-- ============================================================\n" ..
+                "-- ALL GAME SCRIPTS (Logic Only, No Assets)\n" ..
+                "-- Game: %s (ID: %d)\n" ..
+                "-- Total Scripts: %d (Local: %d, Server: %d, Module: %d)\n" ..
+                "-- Instances Scanned: %d\n" ..
+                "-- Date: %s\n" ..
+                "-- ============================================================\n\n",
+                gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
+                scannedInstances, os.date("%Y-%m-%d %H:%M:%S")
+            )
+            
+            for folderKey, scripts in pairs(folderScripts) do
+                combined = combined .. "\n\n" .. string.rep("=", 70) .. "\n"
+                combined = combined .. "-- FOLDER: " .. folderKey .. " (" .. #scripts .. " scripts)\n"
+                combined = combined .. string.rep("=", 70) .. "\n"
+                
+                for _, s in ipairs(scripts) do
+                    combined = combined .. "\n" .. s.header .. s.source .. "\n"
+                end
+                
+                -- Chunk if too large
+                if #combined > 800000 then
+                    SafeWrite(ROOT .. "/ALL_SCRIPTS_combined_part" .. fileCount .. ".lua", combined)
+                    fileCount = fileCount + 1
+                    combined = ""
+                end
+            end
+            if combined ~= "" then
+                SafeWrite(ROOT .. "/ALL_SCRIPTS_combined.lua", combined)
+                fileCount = fileCount + 1
+            end
+            
+            -- Save script index/map
+            local indexText = string.format(
+                "SCRIPTS ONLY DUMP - INDEX\n" ..
+                string.rep("=", 60) .. "\n" ..
+                "Game: %s (ID: %d)\n" ..
+                "Total Scripts: %d\n" ..
+                "  LocalScripts: %d\n" ..
+                "  ServerScripts: %d\n" ..
+                "  ModuleScripts: %d\n" ..
+                "Total Instances Scanned: %d\n" ..
+                "Date: %s\n\n" ..
+                string.rep("=", 60) .. "\n" ..
+                "FOLDER STRUCTURE:\n" ..
+                string.rep("=", 60) .. "\n\n",
+                gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
+                scannedInstances, os.date("%Y-%m-%d %H:%M:%S")
+            )
+            
+            for folderKey, scripts in pairs(folderScripts) do
+                indexText = indexText .. "\n📁 " .. folderKey .. "/ (" .. #scripts .. " scripts)\n"
+                for i, s in ipairs(scripts) do
+                    indexText = indexText .. "  " .. i .. ". [" .. s.class .. "] " .. s.name .. "\n"
+                    indexText = indexText .. "     Path: " .. s.path .. "\n"
+                end
+            end
+            
+            indexText = indexText .. "\n\n" .. string.rep("=", 60) .. "\n"
+            indexText = indexText .. "OUTPUT LOCATION:\n"
+            indexText = indexText .. "  Delta: /sdcard/Delta/workspace/" .. ROOT .. "/\n"
+            indexText = indexText .. "  Fluxus: /sdcard/Fluxus/workspace/" .. ROOT .. "/\n"
+            indexText = indexText .. "\nFOLDER LAYOUT:\n"
+            indexText = indexText .. "  /LocalScripts/    - Client-side scripts\n"
+            indexText = indexText .. "  /ServerScripts/   - Server-side scripts\n"
+            indexText = indexText .. "  /ModuleScripts/   - Module scripts (shared logic)\n"
+            indexText = indexText .. "  /ByFolder/        - Scripts organized by parent folder\n"
+            indexText = indexText .. "  ALL_SCRIPTS_combined.lua - Semua script dalam 1 file\n"
+            
+            SafeWrite(ROOT .. "/INDEX.txt", indexText)
+            fileCount = fileCount + 1
+            
+            -- Done
+            Log("=== SCRIPTS DUMP COMPLETE ===")
+            Log(string.format("Found %d scripts (L:%d S:%d M:%d) from %d instances",
+                scriptCount, localCount, serverCount, moduleCount, scannedInstances))
+            Log("Saved to: workspace/" .. ROOT)
+            UpdateStatus("✅ DONE! " .. scriptCount .. " scripts → " .. fileCount .. " files")
+            
+            ScriptsDeepBtn.Text = "✅ " .. scriptCount .. " scripts extracted!"
+            ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(30, 160, 30)
+            task.wait(5)
+            ScriptsDeepBtn.Text = "📜 SCRIPTS ONLY (Logic Game, Skip Assets)"
+            ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 0)
+            DUMP_RUNNING = false
         end)
     end)
     
