@@ -139,6 +139,38 @@ local function SafeAppend(path, content)
     end)
 end
 
+-- ============================================
+-- TIMEOUT SYSTEM - Skip script yang hang
+-- ============================================
+local DECOMPILE_TIMEOUT = 60 -- 1 menit timeout
+
+local function RunWithTimeout(func, timeoutSec)
+    timeoutSec = timeoutSec or DECOMPILE_TIMEOUT
+    local result = nil
+    local errorMsg = nil
+    local finished = false
+    
+    task.spawn(function()
+        local ok, ret = pcall(func)
+        if ok then
+            result = ret
+        else
+            errorMsg = ret
+        end
+        finished = true
+    end)
+    
+    local start = tick()
+    while not finished and (tick() - start) < timeoutSec do
+        task.wait(0.5)
+    end
+    
+    if not finished then
+        return nil, "TIMEOUT_" .. timeoutSec .. "s"
+    end
+    return result, errorMsg
+end
+
 local function Log(msg)
     print("[MapRip] " .. msg)
     if logBox then
@@ -276,7 +308,7 @@ end
 
 -- ============================================
 -- ULTIMATE DECOMPILER ENGINE v4.0
--- 10+ Layer Fallback - Tembus Semua
+-- 10+ Layer Fallback + TIMEOUT PROTECTION
 -- ============================================
 
 -- Check available executor functions
@@ -310,13 +342,38 @@ local function IsDecompileFailure(src)
 end
 
 -- ============================================
+-- SAFE DECOMPILE - dengan timeout protection
+-- Return: source, error
+-- ============================================
+local function SafeDecompile(...)
+    local args = {...}
+    local src, err = RunWithTimeout(function()
+        return decompile(unpack(args))
+    end, DECOMPILE_TIMEOUT)
+    return src, err
+end
+
+-- Short timeout for secondary decompile (function/proto/gc)
+-- Ini bukan target utama, jadi timeout lebih pendek
+local function QuickDecompile(target)
+    local src, err = RunWithTimeout(function()
+        return decompile(target)
+    end, 15) -- 15 detik aja untuk fungsi individual
+    return src, err
+end
+
+-- ============================================
 -- LAYER 5: getsenv() ENVIRONMENT DUMPER
 -- ============================================
 local function DumpScriptEnvironment(scriptObj)
     if not HAS_GETSENV then return nil end
     
-    local ok, env = pcall(getsenv, scriptObj)
-    if not ok or not env or type(env) ~= "table" then return nil end
+    -- getsenv juga bisa hang, kasih timeout
+    local env, envErr = RunWithTimeout(function()
+        return getsenv(scriptObj)
+    end, 30) -- 30 detik timeout untuk getsenv
+    
+    if not env or type(env) ~= "table" then return nil end
     
     local lines = {}
     lines[#lines+1] = "-- ╔══════════════════════════════════════════════════╗"
@@ -329,7 +386,6 @@ local function DumpScriptEnvironment(scriptObj)
     local varCount = 0
     local tableCount = 0
     
-    -- Sort keys for consistent output
     local keys = {}
     for k in pairs(env) do
         if type(k) == "string" then
@@ -346,7 +402,6 @@ local function DumpScriptEnvironment(scriptObj)
             funcCount = funcCount + 1
             lines[#lines+1] = "-- ═══ FUNCTION: " .. k .. " ═══"
             
-            -- debug.info
             pcall(function()
                 if HAS_DEBUG_GETINFO then
                     local src, line, name = debug.info(v, "sln")
@@ -356,7 +411,6 @@ local function DumpScriptEnvironment(scriptObj)
                 end
             end)
             
-            -- closure type
             pcall(function()
                 if HAS_ISCCLOSURE then
                     lines[#lines+1] = "-- is_c_closure: " .. tostring(iscclosure(v))
@@ -366,7 +420,6 @@ local function DumpScriptEnvironment(scriptObj)
                 end
             end)
             
-            -- constants
             pcall(function()
                 if HAS_DEBUG_GETCONSTANTS then
                     local consts = debug.getconstants(v)
@@ -380,7 +433,6 @@ local function DumpScriptEnvironment(scriptObj)
                 end
             end)
             
-            -- upvalues
             pcall(function()
                 if HAS_DEBUG_GETUPVALUES then
                     local upvals = debug.getupvalues(v)
@@ -405,7 +457,6 @@ local function DumpScriptEnvironment(scriptObj)
                 end
             end)
             
-            -- protos (sub-functions)
             pcall(function()
                 if HAS_DEBUG_GETPROTOS then
                     local protos = debug.getprotos(v)
@@ -416,7 +467,6 @@ local function DumpScriptEnvironment(scriptObj)
                                 local ps, pl, pn = debug.info(pf, "sln")
                                 lines[#lines+1] = "--   proto[" .. pi .. "]: name=" .. tostring(pn) .. " line=" .. tostring(pl)
                             end)
-                            -- Proto constants
                             pcall(function()
                                 if HAS_DEBUG_GETCONSTANTS then
                                     local pconsts = debug.getconstants(pf)
@@ -434,11 +484,11 @@ local function DumpScriptEnvironment(scriptObj)
                 end
             end)
             
-            -- Try decompile the individual function
+            -- Decompile individual function (quick timeout)
             pcall(function()
                 if HAS_DECOMPILE and HAS_ISLCLOSURE and islclosure(v) then
-                    local fok, fsrc = pcall(decompile, v)
-                    if fok and fsrc and not IsDecompileFailure(fsrc) then
+                    local fsrc = QuickDecompile(v)
+                    if fsrc and not IsDecompileFailure(fsrc) then
                         lines[#lines+1] = "-- DECOMPILED FUNCTION SOURCE:"
                         lines[#lines+1] = fsrc
                     end
@@ -480,7 +530,7 @@ local function DumpScriptEnvironment(scriptObj)
     lines[#lines+1] = string.format("-- ENV STATS: %d functions, %d variables, %d tables", funcCount, varCount, tableCount)
     
     if funcCount == 0 and varCount == 0 and tableCount == 0 then
-        return nil -- Empty environment
+        return nil
     end
     
     return table.concat(lines, "\n")
@@ -498,7 +548,6 @@ local function ExtractDebugInfo(scriptObj)
     local info = {}
     info.lines = {}
     
-    -- Basic info
     pcall(function()
         if HAS_DEBUG_GETINFO then
             local src, line, name = debug.info(closure, "sln")
@@ -511,7 +560,6 @@ local function ExtractDebugInfo(scriptObj)
         end
     end)
     
-    -- Constants
     pcall(function()
         if HAS_DEBUG_GETCONSTANTS then
             local consts = debug.getconstants(closure)
@@ -520,14 +568,11 @@ local function ExtractDebugInfo(scriptObj)
                 info.lines[#info.lines+1] = "-- ═══ MAIN FUNCTION CONSTANTS ═══"
                 local strConsts = {}
                 local numConsts = {}
-                local otherConsts = {}
                 for i, c in pairs(consts) do
                     if type(c) == "string" then
                         strConsts[#strConsts+1] = {i, c}
                     elseif type(c) == "number" then
                         numConsts[#numConsts+1] = {i, c}
-                    else
-                        otherConsts[#otherConsts+1] = {i, tostring(c), type(c)}
                     end
                 end
                 if #strConsts > 0 then
@@ -546,7 +591,6 @@ local function ExtractDebugInfo(scriptObj)
         end
     end)
     
-    -- Upvalues
     pcall(function()
         if HAS_DEBUG_GETUPVALUES then
             local upvals = debug.getupvalues(closure)
@@ -571,7 +615,6 @@ local function ExtractDebugInfo(scriptObj)
         end
     end)
     
-    -- Protos (sub-functions) - RECURSIVE
     pcall(function()
         if HAS_DEBUG_GETPROTOS then
             local protos = debug.getprotos(closure)
@@ -621,11 +664,11 @@ local function ExtractDebugInfo(scriptObj)
                         end
                     end)
                     
-                    -- Try decompile individual proto
+                    -- Decompile proto (quick timeout)
                     pcall(function()
                         if HAS_DECOMPILE and HAS_ISLCLOSURE and islclosure(pf) then
-                            local fok, fsrc = pcall(decompile, pf)
-                            if fok and fsrc and not IsDecompileFailure(fsrc) then
+                            local fsrc = QuickDecompile(pf)
+                            if fsrc and not IsDecompileFailure(fsrc) then
                                 info.lines[#info.lines+1] = "--   DECOMPILED:"
                                 for srcLine in fsrc:gmatch("[^\n]+") do
                                     info.lines[#info.lines+1] = "--     " .. srcLine
@@ -634,7 +677,7 @@ local function ExtractDebugInfo(scriptObj)
                         end
                     end)
                     
-                    -- Nested protos (1 level deep)
+                    -- Nested protos (1 level)
                     pcall(function()
                         if HAS_DEBUG_GETPROTOS then
                             local subProtos = debug.getprotos(pf)
@@ -674,6 +717,7 @@ end
 
 -- ============================================
 -- MAIN: UltimateDecompile() - 10+ LAYERS
+-- Semua decompile() pake timeout 60 detik
 -- ============================================
 local function UltimateDecompile(scriptObj)
     DecompileStats.total = DecompileStats.total + 1
@@ -688,7 +732,7 @@ local function UltimateDecompile(scriptObj)
         envDump = nil,
         debugInfo = nil,
         error = nil,
-        layers = {}, -- track which layers were attempted
+        layers = {},
     }
     
     local scriptName = "unknown"
@@ -703,43 +747,51 @@ local function UltimateDecompile(scriptObj)
             result.source = src
             result.method = "source_property"
             DecompileStats.source_prop = DecompileStats.source_prop + 1
-            result.layers[#result.layers+1] = "L1:source_property=OK"
+            result.layers[#result.layers+1] = "L1:source=OK"
         end
     end)
     if result.source and not IsDecompileFailure(result.source) then return result end
-    result.layers[#result.layers+1] = "L1:source_property=FAIL"
+    result.layers[#result.layers+1] = "L1:source=FAIL"
     result.source = nil
     
     -- ═══════════════════════════════════════════
-    -- LAYER 2: decompile() with RETRY (3 attempts)
+    -- LAYER 2: decompile() with RETRY + TIMEOUT
+    -- Timeout 60 detik per attempt
     -- ═══════════════════════════════════════════
     if HAS_DECOMPILE then
         for attempt = 1, 3 do
-            local ok, src = pcall(decompile, scriptObj)
-            if ok and src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+            Log("  L2: decompile attempt " .. attempt .. "/3 [timeout " .. DECOMPILE_TIMEOUT .. "s]...")
+            
+            local src, err = SafeDecompile(scriptObj)
+            
+            if err and tostring(err):find("TIMEOUT") then
+                Log("  ⏰ TIMEOUT attempt " .. attempt .. " - skip!")
+                result.layers[#result.layers+1] = "L2:attempt" .. attempt .. "=TIMEOUT"
+                break -- kalau timeout, skip semua retry (pasti timeout lagi)
+            end
+            
+            if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
                 result.source = src
                 result.method = "decompiled_attempt" .. attempt
                 DecompileStats.decompiled = DecompileStats.decompiled + 1
-                result.layers[#result.layers+1] = "L2:decompile_retry" .. attempt .. "=OK"
+                result.layers[#result.layers+1] = "L2:retry" .. attempt .. "=OK"
                 return result
             end
-            if not ok then
-                result.error = tostring(src)
-            elseif src then
-                result.error = src
+            
+            if not src and err then
+                result.error = tostring(err)
             end
             if attempt < 3 then task.wait(0.3 * attempt) end
         end
-        result.layers[#result.layers+1] = "L2:decompile_retry=FAIL"
+        result.layers[#result.layers+1] = "L2:decompile=FAIL"
     else
         result.layers[#result.layers+1] = "L2:decompile=NOT_AVAILABLE"
     end
     
     -- ═══════════════════════════════════════════
-    -- LAYER 3: Decompile with alternative parameters
+    -- LAYER 3: Decompile alternative params + TIMEOUT
     -- ═══════════════════════════════════════════
     if HAS_DECOMPILE then
-        -- Try timeout parameter
         local tryModes = {
             {args = {scriptObj, 30}, name = "timeout30"},
             {args = {scriptObj, 60}, name = "timeout60"},
@@ -747,42 +799,55 @@ local function UltimateDecompile(scriptObj)
             {args = {scriptObj, "new"}, name = "mode_new"},
         }
         for _, mode in ipairs(tryModes) do
-            pcall(function()
-                local src = decompile(unpack(mode.args))
-                if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
-                    result.source = src
-                    result.method = "decompile_" .. mode.name
-                    DecompileStats.decompiled = DecompileStats.decompiled + 1
-                    result.layers[#result.layers+1] = "L3:" .. mode.name .. "=OK"
-                end
-            end)
-            if result.source then return result end
+            local src, err = RunWithTimeout(function()
+                return decompile(unpack(mode.args))
+            end, DECOMPILE_TIMEOUT)
+            
+            if err and tostring(err):find("TIMEOUT") then
+                result.layers[#result.layers+1] = "L3:" .. mode.name .. "=TIMEOUT"
+                break -- timeout = skip semua mode lainnya
+            end
+            
+            if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+                result.source = src
+                result.method = "decompile_" .. mode.name
+                DecompileStats.decompiled = DecompileStats.decompiled + 1
+                result.layers[#result.layers+1] = "L3:" .. mode.name .. "=OK"
+                return result
+            end
         end
         result.layers[#result.layers+1] = "L3:alt_modes=FAIL"
     end
     
     -- ═══════════════════════════════════════════
-    -- LAYER 4: getscriptclosure → decompile closure
+    -- LAYER 4: getscriptclosure → decompile closure + TIMEOUT
     -- ═══════════════════════════════════════════
     if HAS_GETSCRIPTCLOSURE and HAS_DECOMPILE then
         pcall(function()
             local closure = getscriptclosure(scriptObj)
             if closure then
-                local src = decompile(closure)
-                if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+                local src, err = RunWithTimeout(function()
+                    return decompile(closure)
+                end, DECOMPILE_TIMEOUT)
+                
+                if err and tostring(err):find("TIMEOUT") then
+                    result.layers[#result.layers+1] = "L4:closure=TIMEOUT"
+                elseif src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
                     result.source = src
                     result.method = "closure_decompile"
                     DecompileStats.closure_decompiled = DecompileStats.closure_decompiled + 1
-                    result.layers[#result.layers+1] = "L4:closure_decompile=OK"
+                    result.layers[#result.layers+1] = "L4:closure=OK"
                 end
             end
         end)
         if result.source then return result end
-        result.layers[#result.layers+1] = "L4:closure_decompile=FAIL"
+        if not result.layers[#result.layers]:find("L4") then
+            result.layers[#result.layers+1] = "L4:closure=FAIL"
+        end
     end
     
     -- ═══════════════════════════════════════════
-    -- LAYER 5: getsenv() - Runtime Environment Dump
+    -- LAYER 5: getsenv() - Runtime Environment (with timeout)
     -- ═══════════════════════════════════════════
     local envResult = DumpScriptEnvironment(scriptObj)
     if envResult then
@@ -794,12 +859,17 @@ local function UltimateDecompile(scriptObj)
     end
     
     -- ═══════════════════════════════════════════
-    -- LAYER 6: require() for ModuleScripts
+    -- LAYER 6: require() for ModuleScripts + TIMEOUT
     -- ═══════════════════════════════════════════
     if scriptObj:IsA("ModuleScript") then
-        pcall(function()
-            local moduleData = require(scriptObj)
-            if moduleData ~= nil then
+        local moduleData, modErr = RunWithTimeout(function()
+            return require(scriptObj)
+        end, 30) -- 30 detik timeout untuk require
+        
+        if modErr and tostring(modErr):find("TIMEOUT") then
+            result.layers[#result.layers+1] = "L6:require=TIMEOUT"
+        elseif moduleData ~= nil then
+            pcall(function()
                 local serialized = SerializeDeep(moduleData, 0)
                 if serialized and #serialized > 0 then
                     result.source = "-- MODULE require() RETURN VALUE:\n-- Module: " .. scriptName .. "\n\nreturn " .. serialized
@@ -807,10 +877,11 @@ local function UltimateDecompile(scriptObj)
                     DecompileStats.module_required = DecompileStats.module_required + 1
                     result.layers[#result.layers+1] = "L6:require=OK"
                 end
-            end
-        end)
+            end)
+        else
+            result.layers[#result.layers+1] = "L6:require=FAIL"
+        end
         if result.source then return result end
-        result.layers[#result.layers+1] = "L6:require=FAIL"
     end
     
     -- ═══════════════════════════════════════════
@@ -824,8 +895,6 @@ local function UltimateDecompile(scriptObj)
                 result.bytecodeSize = #bytecode
                 DecompileStats.bytecode_saved = DecompileStats.bytecode_saved + 1
                 result.layers[#result.layers+1] = "L7:bytecode=" .. #bytecode .. "bytes"
-                
-                -- Hex dump for smaller scripts (useful for analysis)
                 if #bytecode < 16384 then
                     result.bytecodeHex = HexEncode(bytecode)
                 end
@@ -854,19 +923,18 @@ local function UltimateDecompile(scriptObj)
     if dbgInfo then
         result.debugInfo = dbgInfo
         DecompileStats.debug_extracted = DecompileStats.debug_extracted + 1
-        result.layers[#result.layers+1] = "L9:debug_info=OK"
+        result.layers[#result.layers+1] = "L9:debug=OK"
     else
-        result.layers[#result.layers+1] = "L9:debug_info=FAIL"
+        result.layers[#result.layers+1] = "L9:debug=FAIL"
     end
     
     -- ═══════════════════════════════════════════
-    -- LAYER 10: getgc() - Scan GC for related functions
+    -- LAYER 10: getgc() - GC function recovery
     -- ═══════════════════════════════════════════
     if HAS_GETGC then
         pcall(function()
-            local gcFuncs = getgc(false) -- functions only
+            local gcFuncs = getgc(false)
             local relatedFuncs = {}
-            local scriptPath = scriptObj:GetFullName()
             
             for _, func in ipairs(gcFuncs) do
                 if type(func) == "function" then
@@ -875,10 +943,8 @@ local function UltimateDecompile(scriptObj)
                             local src, line, name = debug.info(func, "sln")
                             if src and tostring(src):find(scriptObj.Name, 1, true) then
                                 relatedFuncs[#relatedFuncs+1] = {
-                                    source = src,
-                                    line = line,
-                                    name = name,
-                                    func = func,
+                                    source = src, line = line,
+                                    name = name, func = func,
                                 }
                             end
                         end
@@ -888,26 +954,23 @@ local function UltimateDecompile(scriptObj)
             end
             
             if #relatedFuncs > 0 then
-                result.layers[#result.layers+1] = "L10:gc_found=" .. #relatedFuncs .. "_funcs"
+                result.layers[#result.layers+1] = "L10:gc=" .. #relatedFuncs .. "_funcs"
                 DecompileStats.gc_recovered = DecompileStats.gc_recovered + 1
                 
-                -- Try decompile GC functions
                 local gcLines = {"-- ═══ GC RECOVERED FUNCTIONS ═══"}
                 for fi, fdata in ipairs(relatedFuncs) do
-                    gcLines[#gcLines+1] = string.format("-- GC[%d] name=%s line=%s source=%s", 
+                    gcLines[#gcLines+1] = string.format("-- GC[%d] name=%s line=%s source=%s",
                         fi, tostring(fdata.name), tostring(fdata.line), tostring(fdata.source))
                     
+                    -- Quick decompile GC functions (15s timeout)
                     if HAS_DECOMPILE then
-                        pcall(function()
-                            local fsrc = decompile(fdata.func)
-                            if fsrc and not IsDecompileFailure(fsrc) then
-                                gcLines[#gcLines+1] = fsrc
-                                gcLines[#gcLines+1] = ""
-                            end
-                        end)
+                        local fsrc = QuickDecompile(fdata.func)
+                        if fsrc and not IsDecompileFailure(fsrc) then
+                            gcLines[#gcLines+1] = fsrc
+                            gcLines[#gcLines+1] = ""
+                        end
                     end
                     
-                    -- Get constants
                     pcall(function()
                         if HAS_DEBUG_GETCONSTANTS then
                             local consts = debug.getconstants(fdata.func)
@@ -942,40 +1005,33 @@ local function UltimateDecompile(scriptObj)
     parts[#parts+1] = "-- Script: " .. scriptName
     parts[#parts+1] = "-- Class: " .. scriptObj.ClassName
     parts[#parts+1] = "-- Error: " .. tostring(result.error)
-    parts[#parts+1] = "-- Extraction Layers: " .. table.concat(result.layers, " → ")
+    parts[#parts+1] = "-- Layers: " .. table.concat(result.layers, " → ")
     if result.hash then
         parts[#parts+1] = "-- Hash: " .. tostring(result.hash)
     end
     if result.bytecodeSize > 0 then
-        parts[#parts+1] = "-- Bytecode Size: " .. result.bytecodeSize .. " bytes"
+        parts[#parts+1] = "-- Bytecode: " .. result.bytecodeSize .. " bytes"
     end
     
-    -- Enabled/RunContext info
     pcall(function()
-        local enabled = scriptObj.Enabled
-        parts[#parts+1] = "-- Enabled: " .. tostring(enabled)
+        parts[#parts+1] = "-- Enabled: " .. tostring(scriptObj.Enabled)
     end)
     pcall(function()
-        local rc = scriptObj.RunContext
-        parts[#parts+1] = "-- RunContext: " .. tostring(rc)
+        parts[#parts+1] = "-- RunContext: " .. tostring(scriptObj.RunContext)
     end)
     
     parts[#parts+1] = ""
     
     local hasUsefulData = false
     
-    -- Add env dump
     if result.envDump then
         parts[#parts+1] = result.envDump
         parts[#parts+1] = ""
         hasUsefulData = true
     end
     
-    -- Add debug info
     if result.debugInfo and result.debugInfo.lines and #result.debugInfo.lines > 0 then
-        parts[#parts+1] = "-- ═══════════════════════════════════"
-        parts[#parts+1] = "-- DEBUG INFO EXTRACTION"
-        parts[#parts+1] = "-- ═══════════════════════════════════"
+        parts[#parts+1] = "-- ═══ DEBUG INFO ═══"
         for _, line in ipairs(result.debugInfo.lines) do
             parts[#parts+1] = line
         end
@@ -983,12 +1039,9 @@ local function UltimateDecompile(scriptObj)
         hasUsefulData = true
     end
     
-    -- Add bytecode
     if result.bytecodeB64 then
         parts[#parts+1] = string.format("-- ═══ BYTECODE (%d bytes) ═══", result.bytecodeSize)
-        parts[#parts+1] = "-- Base64 encoded - decode + decompile offline dengan tools external"
         parts[#parts+1] = "--[[BYTECODE_BASE64_START"
-        -- Split base64 into 76-char lines
         local b64 = result.bytecodeB64
         for i = 1, #b64, 76 do
             parts[#parts+1] = b64:sub(i, i + 75)
@@ -1008,23 +1061,14 @@ local function UltimateDecompile(scriptObj)
     
     if not hasUsefulData then
         DecompileStats.total_failed = DecompileStats.total_failed + 1
-        parts[#parts+1] = "-- ██████████████████████████████████████████"
-        parts[#parts+1] = "-- ██ COMPLETE FAILURE: No data extracted  ██"
-        parts[#parts+1] = "-- ██████████████████████████████████████████"
-        parts[#parts+1] = "-- Possible reasons:"
-        parts[#parts+1] = "--   1. Server-side script (never sent to client)"
-        parts[#parts+1] = "--   2. Script belum di-load/running"
-        parts[#parts+1] = "--   3. Executor tidak support API yang dibutuhkan"
-        parts[#parts+1] = "--   4. Script heavily obfuscated (Luraph/Moonsec/IronBrew)"
-        parts[#parts+1] = "--   5. Bytecode version incompatible"
+        parts[#parts+1] = "-- COMPLETE FAILURE: No data extracted"
+        parts[#parts+1] = "-- Possible: server-side only / not loaded / obfuscated"
         result.method = "failed"
     else
         result.method = "fallback_composite"
     end
     
     result.source = table.concat(parts, "\n")
-    
-    -- Track method
     DecompileStats.methods[scriptName] = result.method
     
     return result
