@@ -1,19 +1,34 @@
+
+-- ======================================================================
+-- PART: 01_core.lua
+-- ======================================================================
+
 --[[
-    ULTIMATE MAP DUMPER v3.0 - Delta Executor Compatible
-    ====================================================
-    AMBIL SEMUA tanpa pengecualian:
-    - Semua Script (LocalScript, Script, ModuleScript)
-    - Semua Model, Part, MeshPart, Union
-    - Semua Sound, Animation, Particle
-    - Semua GUI (ScreenGui, BillboardGui, SurfaceGui)
-    - Semua Lighting effects
-    - Semua Terrain data
-    - Semua Asset IDs (Texture, Decal, Sound, Mesh, Animation)
-    - Semua Value objects (StringValue, IntValue, etc)
-    - Semua Folders & struktur lengkap
-    - TANPA FILTER - semua diambil termasuk nama random/acak
+    ULTIMATE MAP DUMPER v4.0 - OVERPOWERED EDITION
+    ================================================
+    MAXIMUM EXTRACTION - Tembus semua script tanpa pengecualian
     
-    Compatible: Delta, Fluxus, Arceus X, Hydrogen, Synapse
+    10+ Layer Decompile Fallback:
+      1. Source Property
+      2. decompile() dengan Retry 3x
+      3. decompile() mode alternatif (timeout/new)
+      4. getscriptclosure() → decompile closure
+      5. getsenv() - Dump Runtime Environment
+      6. require() untuk ModuleScript
+      7. getscriptbytecode() → Base64 + Hex
+      8. getscripthash() untuk identifikasi
+      9. debug.info/getconstants/getupvalues/getprotos
+     10. getgc() scan untuk function recovery
+    
+    Extra Scanner:
+      - getnilinstances() - Script tersembunyi (parent = nil)
+      - getrunningscripts() - Script yang sedang aktif
+      - getloadedmodules() - ModuleScript yang sudah di-load
+      - getgc() - Scan Garbage Collector
+      - CoreGui scan
+      - PlayerGui/Backpack/PlayerScripts deep scan
+    
+    Compatible: Delta, Fluxus, Arceus X, Hydrogen, Synapse, Wave, Solara
     Output: workspace/MapRip/[GameName]/
 ]]
 
@@ -30,7 +45,6 @@ local StarterPack = game:GetService("StarterPack")
 local StarterPlayer = game:GetService("StarterPlayer")
 local SoundService = game:GetService("SoundService")
 local Teams = game:GetService("Teams")
-local ServerStorage = game:GetService("ServerStorage")
 local LocalPlayer = Players.LocalPlayer
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -45,6 +59,21 @@ local totalScripts = 0
 local totalAssets = 0
 local totalFiles = 0
 local statusLabel, progressLabel, logBox
+
+-- Decompile Statistics
+local DecompileStats = {
+    total = 0,
+    decompiled = 0,
+    source_prop = 0,
+    bytecode_saved = 0,
+    env_dumped = 0,
+    closure_decompiled = 0,
+    module_required = 0,
+    debug_extracted = 0,
+    gc_recovered = 0,
+    total_failed = 0,
+    methods = {}, -- per-script tracking
+}
 
 -- ============================================
 -- UTILITIES
@@ -68,9 +97,11 @@ local function MakeFolder(path)
     local current = ""
     for i, part in ipairs(parts) do
         current = (i == 1) and part or (current .. "/" .. part)
-        if not isfolder(current) then
-            makefolder(current)
-        end
+        pcall(function()
+            if not isfolder(current) then
+                makefolder(current)
+            end
+        end)
     end
 end
 
@@ -83,6 +114,20 @@ local function SafeWrite(path, content)
         return true
     end
     return false
+end
+
+local function SafeAppend(path, content)
+    local ok = pcall(function()
+        appendfile(path, content or "")
+    end)
+    if not ok then
+        -- fallback: read + write
+        pcall(function()
+            local existing = ""
+            pcall(function() existing = readfile(path) end)
+            writefile(path, existing .. (content or ""))
+        end)
+    end
 end
 
 local function Log(msg)
@@ -101,34 +146,890 @@ end
 
 local function UpdateProgress()
     if progressLabel then
-        progressLabel.Text = string.format("Instances: %d | Scripts: %d | Assets: %d | Files: %d", 
-            totalInstances, totalScripts, totalAssets, totalFiles)
+        progressLabel.Text = string.format(
+            "Inst: %d | Scripts: %d | Assets: %d | Files: %d | OK: %d | Fail: %d", 
+            totalInstances, totalScripts, totalAssets, totalFiles,
+            DecompileStats.decompiled + DecompileStats.source_prop + DecompileStats.closure_decompiled + DecompileStats.module_required,
+            DecompileStats.total_failed
+        )
     end
 end
 
 -- ============================================
--- DECOMPILER
+-- BASE64 ENCODER
 -- ============================================
-local function DecompileScript(scr)
-    local src = nil
-    -- Try direct source access
-    pcall(function() src = scr.Source end)
-    if src and src ~= "" then return src end
+local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function Base64Encode(data)
+    if not data or #data == 0 then return "" end
+    local result = {}
+    local bytes = {string.byte(data, 1, math.min(#data, 262144))} -- cap at 256KB
+    local padding = (3 - (#bytes % 3)) % 3
+    for i = 1, padding do bytes[#bytes + 1] = 0 end
     
-    -- Try decompile
-    if decompile then
-        local ok, result = pcall(decompile, scr)
-        if ok and result then return result end
+    for i = 1, #bytes, 3 do
+        local b1, b2, b3 = bytes[i], bytes[i+1] or 0, bytes[i+2] or 0
+        local n = b1 * 65536 + b2 * 256 + b3
+        local c1 = math.floor(n / 262144) % 64
+        local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64
+        local c4 = n % 64
+        result[#result+1] = B64_CHARS:sub(c1+1, c1+1)
+        result[#result+1] = B64_CHARS:sub(c2+1, c2+1)
+        result[#result+1] = B64_CHARS:sub(c3+1, c3+1)
+        result[#result+1] = B64_CHARS:sub(c4+1, c4+1)
     end
-    
-    -- Try getscriptbytecode
-    if getscriptbytecode then
-        local ok, result = pcall(getscriptbytecode, scr)
-        if ok and result then return "-- [Bytecode]\n" .. result end
-    end
-    
-    return "-- [Cannot decompile: " .. scr:GetFullName() .. "]"
+    if padding >= 1 then result[#result] = "=" end
+    if padding >= 2 then result[#result-1] = "=" end
+    return table.concat(result)
 end
+
+-- ============================================
+-- HEX ENCODER
+-- ============================================
+local function HexEncode(data, maxBytes)
+    if not data or #data == 0 then return "" end
+    maxBytes = maxBytes or 8192
+    local hex = {}
+    local len = math.min(#data, maxBytes)
+    for i = 1, len do
+        hex[#hex+1] = string.format("%02X", string.byte(data, i))
+        if i % 32 == 0 then hex[#hex+1] = "\n" end
+    end
+    if len < #data then
+        hex[#hex+1] = string.format("\n... (truncated, showing %d/%d bytes)", len, #data)
+    end
+    return table.concat(hex, " ")
+end
+
+-- ============================================
+-- DEEP TABLE SERIALIZER (for require/getsenv)
+-- ============================================
+local function SerializeDeep(val, depth, visited)
+    depth = depth or 0
+    visited = visited or {}
+    
+    if depth > 8 then return '"[MAX_DEPTH]"' end
+    
+    local t = type(val)
+    if t == "nil" then return "nil"
+    elseif t == "string" then 
+        if #val > 500 then
+            return '"' .. val:sub(1, 500):gsub('"', '\\"'):gsub("\n", "\\n") .. '... [truncated]"'
+        end
+        return '"' .. val:gsub('"', '\\"'):gsub("\n", "\\n") .. '"'
+    elseif t == "number" or t == "boolean" then return tostring(val)
+    elseif t == "function" then
+        local info = ""
+        pcall(function()
+            local s, l, n = debug.info(val, "sln")
+            info = string.format("source=%s line=%s name=%s", tostring(s), tostring(l), tostring(n))
+        end)
+        return '"[function: ' .. info .. ']"'
+    elseif t == "table" then
+        if visited[val] then return '"[CIRCULAR_REF]"' end
+        visited[val] = true
+        
+        local items = {}
+        local count = 0
+        local indent = string.rep("  ", depth + 1)
+        
+        for k, v in pairs(val) do
+            count = count + 1
+            if count > 100 then
+                items[#items+1] = indent .. "-- ... (" .. count .. "+ entries, truncated)"
+                break
+            end
+            local key
+            if type(k) == "string" then
+                if k:match("^[%a_][%w_]*$") then
+                    key = k
+                else
+                    key = '["' .. k:gsub('"', '\\"') .. '"]'
+                end
+            else
+                key = "[" .. tostring(k) .. "]"
+            end
+            items[#items+1] = indent .. key .. " = " .. SerializeDeep(v, depth + 1, visited)
+        end
+        
+        if #items == 0 then return "{}" end
+        local outerIndent = string.rep("  ", depth)
+        return "{\n" .. table.concat(items, ",\n") .. "\n" .. outerIndent .. "}"
+    elseif t == "userdata" then
+        local str = ""
+        pcall(function() str = tostring(val) end)
+        return '"[userdata: ' .. str .. ']"'
+    else
+        return '"[' .. t .. ': ' .. tostring(val) .. ']"'
+    end
+end
+
+
+-- ======================================================================
+-- PART: 02_decompiler.lua
+-- ======================================================================
+
+-- ============================================
+-- ULTIMATE DECOMPILER ENGINE v4.0
+-- 10+ Layer Fallback - Tembus Semua
+-- ============================================
+
+-- Check available executor functions
+local HAS_DECOMPILE = type(decompile) == "function"
+local HAS_GETSCRIPTBYTECODE = type(getscriptbytecode) == "function"
+local HAS_GETSCRIPTHASH = type(getscripthash) == "function"
+local HAS_GETSCRIPTCLOSURE = type(getscriptclosure) == "function"
+local HAS_GETSENV = type(getsenv) == "function"
+local HAS_GETNILINSTANCES = type(getnilinstances) == "function"
+local HAS_GETRUNNINGSCRIPTS = type(getrunningscripts) == "function"
+local HAS_GETLOADEDMODULES = type(getloadedmodules) == "function"
+local HAS_GETGC = type(getgc) == "function"
+local HAS_GETINSTANCES = type(getinstances) == "function"
+local HAS_DEBUG_GETCONSTANTS = type(debug) == "table" and type(debug.getconstants) == "function"
+local HAS_DEBUG_GETUPVALUES = type(debug) == "table" and type(debug.getupvalues) == "function"
+local HAS_DEBUG_GETPROTOS = type(debug) == "table" and type(debug.getprotos) == "function"
+local HAS_DEBUG_GETINFO = type(debug) == "table" and type(debug.info) == "function"
+local HAS_ISCCLOSURE = type(iscclosure) == "function"
+local HAS_ISLCLOSURE = type(islclosure) == "function"
+
+local function IsDecompileFailure(src)
+    if not src or type(src) ~= "string" or #src == 0 then return true end
+    local lower = src:lower()
+    return lower:find("failed to decompile") ~= nil
+        or lower:find("cannot decompile") ~= nil
+        or lower:find("decompilation failed") ~= nil
+        or lower:find("error decompiling") ~= nil
+        or lower:find("decompile timed out") ~= nil
+        or lower:find("-- unsynapse decompiler") ~= nil
+        or lower:find("timed out") ~= nil
+end
+
+-- ============================================
+-- LAYER 5: getsenv() ENVIRONMENT DUMPER
+-- ============================================
+local function DumpScriptEnvironment(scriptObj)
+    if not HAS_GETSENV then return nil end
+    
+    local ok, env = pcall(getsenv, scriptObj)
+    if not ok or not env or type(env) ~= "table" then return nil end
+    
+    local lines = {}
+    lines[#lines+1] = "-- ╔══════════════════════════════════════════════════╗"
+    lines[#lines+1] = "-- ║  RUNTIME ENVIRONMENT DUMP (getsenv)             ║"
+    lines[#lines+1] = "-- ║  Script: " .. scriptObj.Name
+    lines[#lines+1] = "-- ╚══════════════════════════════════════════════════╝"
+    lines[#lines+1] = ""
+    
+    local funcCount = 0
+    local varCount = 0
+    local tableCount = 0
+    
+    -- Sort keys for consistent output
+    local keys = {}
+    for k in pairs(env) do
+        if type(k) == "string" then
+            keys[#keys+1] = k
+        end
+    end
+    table.sort(keys)
+    
+    for _, k in ipairs(keys) do
+        local v = env[k]
+        local vtype = type(v)
+        
+        if vtype == "function" then
+            funcCount = funcCount + 1
+            lines[#lines+1] = "-- ═══ FUNCTION: " .. k .. " ═══"
+            
+            -- debug.info
+            pcall(function()
+                if HAS_DEBUG_GETINFO then
+                    local src, line, name = debug.info(v, "sln")
+                    lines[#lines+1] = "-- source: " .. tostring(src)
+                    lines[#lines+1] = "-- line: " .. tostring(line)
+                    lines[#lines+1] = "-- name: " .. tostring(name)
+                end
+            end)
+            
+            -- closure type
+            pcall(function()
+                if HAS_ISCCLOSURE then
+                    lines[#lines+1] = "-- is_c_closure: " .. tostring(iscclosure(v))
+                end
+                if HAS_ISLCLOSURE then
+                    lines[#lines+1] = "-- is_lua_closure: " .. tostring(islclosure(v))
+                end
+            end)
+            
+            -- constants
+            pcall(function()
+                if HAS_DEBUG_GETCONSTANTS then
+                    local consts = debug.getconstants(v)
+                    if consts and #consts > 0 then
+                        lines[#lines+1] = "-- constants: {"
+                        for ci, cv in pairs(consts) do
+                            lines[#lines+1] = "--   [" .. tostring(ci) .. "] = " .. tostring(cv) .. " (" .. type(cv) .. ")"
+                        end
+                        lines[#lines+1] = "-- }"
+                    end
+                end
+            end)
+            
+            -- upvalues
+            pcall(function()
+                if HAS_DEBUG_GETUPVALUES then
+                    local upvals = debug.getupvalues(v)
+                    if upvals then
+                        local hasData = false
+                        for _ in pairs(upvals) do hasData = true; break end
+                        if hasData then
+                            lines[#lines+1] = "-- upvalues: {"
+                            for ui, uv in pairs(upvals) do
+                                local uvStr = tostring(uv)
+                                if type(uv) == "table" then
+                                    uvStr = SerializeDeep(uv, 0)
+                                    if #uvStr > 500 then uvStr = uvStr:sub(1, 500) .. "..." end
+                                elseif type(uv) == "string" then
+                                    uvStr = '"' .. uv:sub(1, 200) .. '"'
+                                end
+                                lines[#lines+1] = "--   [" .. tostring(ui) .. "] = " .. uvStr
+                            end
+                            lines[#lines+1] = "-- }"
+                        end
+                    end
+                end
+            end)
+            
+            -- protos (sub-functions)
+            pcall(function()
+                if HAS_DEBUG_GETPROTOS then
+                    local protos = debug.getprotos(v)
+                    if protos and #protos > 0 then
+                        lines[#lines+1] = "-- sub_functions: " .. #protos
+                        for pi, pf in ipairs(protos) do
+                            pcall(function()
+                                local ps, pl, pn = debug.info(pf, "sln")
+                                lines[#lines+1] = "--   proto[" .. pi .. "]: name=" .. tostring(pn) .. " line=" .. tostring(pl)
+                            end)
+                            -- Proto constants
+                            pcall(function()
+                                if HAS_DEBUG_GETCONSTANTS then
+                                    local pconsts = debug.getconstants(pf)
+                                    if pconsts and #pconsts > 0 then
+                                        lines[#lines+1] = "--     constants: {"
+                                        for pci, pcv in pairs(pconsts) do
+                                            lines[#lines+1] = "--       [" .. tostring(pci) .. "] = " .. tostring(pcv)
+                                        end
+                                        lines[#lines+1] = "--     }"
+                                    end
+                                end
+                            end)
+                        end
+                    end
+                end
+            end)
+            
+            -- Try decompile the individual function
+            pcall(function()
+                if HAS_DECOMPILE and HAS_ISLCLOSURE and islclosure(v) then
+                    local fok, fsrc = pcall(decompile, v)
+                    if fok and fsrc and not IsDecompileFailure(fsrc) then
+                        lines[#lines+1] = "-- DECOMPILED FUNCTION SOURCE:"
+                        lines[#lines+1] = fsrc
+                    end
+                end
+            end)
+            
+            lines[#lines+1] = "function " .. k .. "(...) --[[ see debug info above ]] end"
+            lines[#lines+1] = ""
+            
+        elseif vtype == "table" then
+            tableCount = tableCount + 1
+            lines[#lines+1] = "-- ═══ TABLE: " .. k .. " ═══"
+            local serialized = SerializeDeep(v, 0)
+            if #serialized > 5000 then
+                serialized = serialized:sub(1, 5000) .. "\n-- ... [TABLE TRUNCATED]"
+            end
+            lines[#lines+1] = "local " .. k .. " = " .. serialized
+            lines[#lines+1] = ""
+            
+        elseif vtype == "string" then
+            varCount = varCount + 1
+            local display = v
+            if #display > 1000 then display = display:sub(1, 1000) .. "... [TRUNCATED]" end
+            lines[#lines+1] = 'local ' .. k .. ' = "' .. display:gsub('"', '\\"'):gsub("\n", "\\n") .. '"'
+            
+        elseif vtype == "number" or vtype == "boolean" then
+            varCount = varCount + 1
+            lines[#lines+1] = "local " .. k .. " = " .. tostring(v)
+            
+        elseif vtype == "userdata" then
+            varCount = varCount + 1
+            local str = ""
+            pcall(function() str = tostring(v) end)
+            lines[#lines+1] = "local " .. k .. " = nil -- [userdata: " .. str .. "]"
+        end
+    end
+    
+    lines[#lines+1] = ""
+    lines[#lines+1] = string.format("-- ENV STATS: %d functions, %d variables, %d tables", funcCount, varCount, tableCount)
+    
+    if funcCount == 0 and varCount == 0 and tableCount == 0 then
+        return nil -- Empty environment
+    end
+    
+    return table.concat(lines, "\n")
+end
+
+-- ============================================
+-- LAYER 9: DEBUG INFO EXTRACTOR
+-- ============================================
+local function ExtractDebugInfo(scriptObj)
+    if not HAS_GETSCRIPTCLOSURE then return nil end
+    
+    local ok, closure = pcall(getscriptclosure, scriptObj)
+    if not ok or not closure then return nil end
+    
+    local info = {}
+    info.lines = {}
+    
+    -- Basic info
+    pcall(function()
+        if HAS_DEBUG_GETINFO then
+            local src, line, name = debug.info(closure, "sln")
+            info.source = src
+            info.line = line
+            info.name = name
+            info.lines[#info.lines+1] = "-- Debug Source: " .. tostring(src)
+            info.lines[#info.lines+1] = "-- Debug Line: " .. tostring(line)
+            info.lines[#info.lines+1] = "-- Debug Name: " .. tostring(name)
+        end
+    end)
+    
+    -- Constants
+    pcall(function()
+        if HAS_DEBUG_GETCONSTANTS then
+            local consts = debug.getconstants(closure)
+            if consts then
+                info.constants = consts
+                info.lines[#info.lines+1] = "-- ═══ MAIN FUNCTION CONSTANTS ═══"
+                local strConsts = {}
+                local numConsts = {}
+                local otherConsts = {}
+                for i, c in pairs(consts) do
+                    if type(c) == "string" then
+                        strConsts[#strConsts+1] = {i, c}
+                    elseif type(c) == "number" then
+                        numConsts[#numConsts+1] = {i, c}
+                    else
+                        otherConsts[#otherConsts+1] = {i, tostring(c), type(c)}
+                    end
+                end
+                if #strConsts > 0 then
+                    info.lines[#info.lines+1] = "-- String Constants:"
+                    for _, sc in ipairs(strConsts) do
+                        info.lines[#info.lines+1] = '--   [' .. sc[1] .. '] = "' .. tostring(sc[2]):sub(1, 200) .. '"'
+                    end
+                end
+                if #numConsts > 0 then
+                    info.lines[#info.lines+1] = "-- Number Constants:"
+                    for _, nc in ipairs(numConsts) do
+                        info.lines[#info.lines+1] = "--   [" .. nc[1] .. "] = " .. nc[2]
+                    end
+                end
+            end
+        end
+    end)
+    
+    -- Upvalues
+    pcall(function()
+        if HAS_DEBUG_GETUPVALUES then
+            local upvals = debug.getupvalues(closure)
+            if upvals then
+                info.upvalues = upvals
+                local hasData = false
+                for _ in pairs(upvals) do hasData = true; break end
+                if hasData then
+                    info.lines[#info.lines+1] = "-- ═══ UPVALUES ═══"
+                    for i, uv in pairs(upvals) do
+                        local uvStr = tostring(uv)
+                        if type(uv) == "table" then
+                            uvStr = SerializeDeep(uv, 0)
+                            if #uvStr > 1000 then uvStr = uvStr:sub(1, 1000) .. "..." end
+                        elseif type(uv) == "string" then
+                            uvStr = '"' .. uv:sub(1, 300) .. '"'
+                        end
+                        info.lines[#info.lines+1] = "--   upvalue[" .. tostring(i) .. "] = " .. uvStr .. " (" .. type(uv) .. ")"
+                    end
+                end
+            end
+        end
+    end)
+    
+    -- Protos (sub-functions) - RECURSIVE
+    pcall(function()
+        if HAS_DEBUG_GETPROTOS then
+            local protos = debug.getprotos(closure)
+            if protos and #protos > 0 then
+                info.protos = protos
+                info.lines[#info.lines+1] = "-- ═══ SUB-FUNCTIONS (" .. #protos .. " protos) ═══"
+                
+                for pi, pf in ipairs(protos) do
+                    info.lines[#info.lines+1] = "-- ┌─ Proto[" .. pi .. "]"
+                    
+                    pcall(function()
+                        if HAS_DEBUG_GETINFO then
+                            local ps, pl, pn = debug.info(pf, "sln")
+                            info.lines[#info.lines+1] = "--   name: " .. tostring(pn) .. " | line: " .. tostring(pl)
+                        end
+                    end)
+                    
+                    pcall(function()
+                        if HAS_DEBUG_GETCONSTANTS then
+                            local pconsts = debug.getconstants(pf)
+                            if pconsts then
+                                info.lines[#info.lines+1] = "--   constants:"
+                                for pci, pcv in pairs(pconsts) do
+                                    if type(pcv) == "string" then
+                                        info.lines[#info.lines+1] = '--     [' .. pci .. '] = "' .. pcv:sub(1, 150) .. '"'
+                                    elseif type(pcv) == "number" then
+                                        info.lines[#info.lines+1] = "--     [" .. pci .. "] = " .. pcv
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                    
+                    pcall(function()
+                        if HAS_DEBUG_GETUPVALUES then
+                            local pupvals = debug.getupvalues(pf)
+                            if pupvals then
+                                local hasP = false
+                                for _ in pairs(pupvals) do hasP = true; break end
+                                if hasP then
+                                    info.lines[#info.lines+1] = "--   upvalues:"
+                                    for pui, puv in pairs(pupvals) do
+                                        info.lines[#info.lines+1] = "--     [" .. pui .. "] = " .. tostring(puv):sub(1, 200)
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                    
+                    -- Try decompile individual proto
+                    pcall(function()
+                        if HAS_DECOMPILE and HAS_ISLCLOSURE and islclosure(pf) then
+                            local fok, fsrc = pcall(decompile, pf)
+                            if fok and fsrc and not IsDecompileFailure(fsrc) then
+                                info.lines[#info.lines+1] = "--   DECOMPILED:"
+                                for srcLine in fsrc:gmatch("[^\n]+") do
+                                    info.lines[#info.lines+1] = "--     " .. srcLine
+                                end
+                            end
+                        end
+                    end)
+                    
+                    -- Nested protos (1 level deep)
+                    pcall(function()
+                        if HAS_DEBUG_GETPROTOS then
+                            local subProtos = debug.getprotos(pf)
+                            if subProtos and #subProtos > 0 then
+                                info.lines[#info.lines+1] = "--   nested_protos: " .. #subProtos
+                                for spi, spf in ipairs(subProtos) do
+                                    pcall(function()
+                                        local ss, sl, sn = debug.info(spf, "sln")
+                                        info.lines[#info.lines+1] = "--     sub[" .. spi .. "]: " .. tostring(sn) .. " @ line " .. tostring(sl)
+                                    end)
+                                    pcall(function()
+                                        if HAS_DEBUG_GETCONSTANTS then
+                                            local sconsts = debug.getconstants(spf)
+                                            if sconsts then
+                                                for sci, scv in pairs(sconsts) do
+                                                    if type(scv) == "string" then
+                                                        info.lines[#info.lines+1] = '--       const[' .. sci .. '] = "' .. scv:sub(1, 100) .. '"'
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end)
+                                end
+                            end
+                        end
+                    end)
+                    
+                    info.lines[#info.lines+1] = "-- └─────────────────"
+                end
+            end
+        end
+    end)
+    
+    if #info.lines == 0 then return nil end
+    return info
+end
+
+-- ============================================
+-- MAIN: UltimateDecompile() - 10+ LAYERS
+-- ============================================
+local function UltimateDecompile(scriptObj)
+    DecompileStats.total = DecompileStats.total + 1
+    
+    local result = {
+        source = nil,
+        method = "failed",
+        bytecodeB64 = nil,
+        bytecodeHex = nil,
+        bytecodeSize = 0,
+        hash = nil,
+        envDump = nil,
+        debugInfo = nil,
+        error = nil,
+        layers = {}, -- track which layers were attempted
+    }
+    
+    local scriptName = "unknown"
+    pcall(function() scriptName = scriptObj:GetFullName() end)
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 1: Direct Source Property
+    -- ═══════════════════════════════════════════
+    pcall(function()
+        local src = scriptObj.Source
+        if src and type(src) == "string" and #src > 0 then
+            result.source = src
+            result.method = "source_property"
+            DecompileStats.source_prop = DecompileStats.source_prop + 1
+            result.layers[#result.layers+1] = "L1:source_property=OK"
+        end
+    end)
+    if result.source and not IsDecompileFailure(result.source) then return result end
+    result.layers[#result.layers+1] = "L1:source_property=FAIL"
+    result.source = nil
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 2: decompile() with RETRY (3 attempts)
+    -- ═══════════════════════════════════════════
+    if HAS_DECOMPILE then
+        for attempt = 1, 3 do
+            local ok, src = pcall(decompile, scriptObj)
+            if ok and src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+                result.source = src
+                result.method = "decompiled_attempt" .. attempt
+                DecompileStats.decompiled = DecompileStats.decompiled + 1
+                result.layers[#result.layers+1] = "L2:decompile_retry" .. attempt .. "=OK"
+                return result
+            end
+            if not ok then
+                result.error = tostring(src)
+            elseif src then
+                result.error = src
+            end
+            if attempt < 3 then task.wait(0.3 * attempt) end
+        end
+        result.layers[#result.layers+1] = "L2:decompile_retry=FAIL"
+    else
+        result.layers[#result.layers+1] = "L2:decompile=NOT_AVAILABLE"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 3: Decompile with alternative parameters
+    -- ═══════════════════════════════════════════
+    if HAS_DECOMPILE then
+        -- Try timeout parameter
+        local tryModes = {
+            {args = {scriptObj, 30}, name = "timeout30"},
+            {args = {scriptObj, 60}, name = "timeout60"},
+            {args = {scriptObj, true}, name = "flag_true"},
+            {args = {scriptObj, "new"}, name = "mode_new"},
+        }
+        for _, mode in ipairs(tryModes) do
+            pcall(function()
+                local src = decompile(unpack(mode.args))
+                if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+                    result.source = src
+                    result.method = "decompile_" .. mode.name
+                    DecompileStats.decompiled = DecompileStats.decompiled + 1
+                    result.layers[#result.layers+1] = "L3:" .. mode.name .. "=OK"
+                end
+            end)
+            if result.source then return result end
+        end
+        result.layers[#result.layers+1] = "L3:alt_modes=FAIL"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 4: getscriptclosure → decompile closure
+    -- ═══════════════════════════════════════════
+    if HAS_GETSCRIPTCLOSURE and HAS_DECOMPILE then
+        pcall(function()
+            local closure = getscriptclosure(scriptObj)
+            if closure then
+                local src = decompile(closure)
+                if src and type(src) == "string" and #src > 0 and not IsDecompileFailure(src) then
+                    result.source = src
+                    result.method = "closure_decompile"
+                    DecompileStats.closure_decompiled = DecompileStats.closure_decompiled + 1
+                    result.layers[#result.layers+1] = "L4:closure_decompile=OK"
+                end
+            end
+        end)
+        if result.source then return result end
+        result.layers[#result.layers+1] = "L4:closure_decompile=FAIL"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 5: getsenv() - Runtime Environment Dump
+    -- ═══════════════════════════════════════════
+    local envResult = DumpScriptEnvironment(scriptObj)
+    if envResult then
+        result.envDump = envResult
+        DecompileStats.env_dumped = DecompileStats.env_dumped + 1
+        result.layers[#result.layers+1] = "L5:getsenv=OK"
+    else
+        result.layers[#result.layers+1] = "L5:getsenv=FAIL"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 6: require() for ModuleScripts
+    -- ═══════════════════════════════════════════
+    if scriptObj:IsA("ModuleScript") then
+        pcall(function()
+            local moduleData = require(scriptObj)
+            if moduleData ~= nil then
+                local serialized = SerializeDeep(moduleData, 0)
+                if serialized and #serialized > 0 then
+                    result.source = "-- MODULE require() RETURN VALUE:\n-- Module: " .. scriptName .. "\n\nreturn " .. serialized
+                    result.method = "module_required"
+                    DecompileStats.module_required = DecompileStats.module_required + 1
+                    result.layers[#result.layers+1] = "L6:require=OK"
+                end
+            end
+        end)
+        if result.source then return result end
+        result.layers[#result.layers+1] = "L6:require=FAIL"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 7: getscriptbytecode → Base64 + Hex
+    -- ═══════════════════════════════════════════
+    if HAS_GETSCRIPTBYTECODE then
+        pcall(function()
+            local bytecode = getscriptbytecode(scriptObj)
+            if bytecode and type(bytecode) == "string" and #bytecode > 0 then
+                result.bytecodeB64 = Base64Encode(bytecode)
+                result.bytecodeSize = #bytecode
+                DecompileStats.bytecode_saved = DecompileStats.bytecode_saved + 1
+                result.layers[#result.layers+1] = "L7:bytecode=" .. #bytecode .. "bytes"
+                
+                -- Hex dump for smaller scripts (useful for analysis)
+                if #bytecode < 16384 then
+                    result.bytecodeHex = HexEncode(bytecode)
+                end
+            end
+        end)
+    else
+        result.layers[#result.layers+1] = "L7:bytecode=NOT_AVAILABLE"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 8: getscripthash
+    -- ═══════════════════════════════════════════
+    if HAS_GETSCRIPTHASH then
+        pcall(function()
+            result.hash = getscripthash(scriptObj)
+            if result.hash then
+                result.layers[#result.layers+1] = "L8:hash=" .. tostring(result.hash)
+            end
+        end)
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 9: Debug Info Deep Extraction
+    -- ═══════════════════════════════════════════
+    local dbgInfo = ExtractDebugInfo(scriptObj)
+    if dbgInfo then
+        result.debugInfo = dbgInfo
+        DecompileStats.debug_extracted = DecompileStats.debug_extracted + 1
+        result.layers[#result.layers+1] = "L9:debug_info=OK"
+    else
+        result.layers[#result.layers+1] = "L9:debug_info=FAIL"
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- LAYER 10: getgc() - Scan GC for related functions
+    -- ═══════════════════════════════════════════
+    if HAS_GETGC then
+        pcall(function()
+            local gcFuncs = getgc(false) -- functions only
+            local relatedFuncs = {}
+            local scriptPath = scriptObj:GetFullName()
+            
+            for _, func in ipairs(gcFuncs) do
+                if type(func) == "function" then
+                    pcall(function()
+                        if HAS_DEBUG_GETINFO then
+                            local src, line, name = debug.info(func, "sln")
+                            if src and tostring(src):find(scriptObj.Name, 1, true) then
+                                relatedFuncs[#relatedFuncs+1] = {
+                                    source = src,
+                                    line = line,
+                                    name = name,
+                                    func = func,
+                                }
+                            end
+                        end
+                    end)
+                end
+                if #relatedFuncs >= 50 then break end
+            end
+            
+            if #relatedFuncs > 0 then
+                result.layers[#result.layers+1] = "L10:gc_found=" .. #relatedFuncs .. "_funcs"
+                DecompileStats.gc_recovered = DecompileStats.gc_recovered + 1
+                
+                -- Try decompile GC functions
+                local gcLines = {"-- ═══ GC RECOVERED FUNCTIONS ═══"}
+                for fi, fdata in ipairs(relatedFuncs) do
+                    gcLines[#gcLines+1] = string.format("-- GC[%d] name=%s line=%s source=%s", 
+                        fi, tostring(fdata.name), tostring(fdata.line), tostring(fdata.source))
+                    
+                    if HAS_DECOMPILE then
+                        pcall(function()
+                            local fsrc = decompile(fdata.func)
+                            if fsrc and not IsDecompileFailure(fsrc) then
+                                gcLines[#gcLines+1] = fsrc
+                                gcLines[#gcLines+1] = ""
+                            end
+                        end)
+                    end
+                    
+                    -- Get constants
+                    pcall(function()
+                        if HAS_DEBUG_GETCONSTANTS then
+                            local consts = debug.getconstants(fdata.func)
+                            if consts and #consts > 0 then
+                                gcLines[#gcLines+1] = "-- constants:"
+                                for ci, cv in pairs(consts) do
+                                    gcLines[#gcLines+1] = "--   " .. tostring(ci) .. " = " .. tostring(cv)
+                                end
+                            end
+                        end
+                    end)
+                end
+                
+                if not result.envDump then
+                    result.envDump = table.concat(gcLines, "\n")
+                else
+                    result.envDump = result.envDump .. "\n\n" .. table.concat(gcLines, "\n")
+                end
+            else
+                result.layers[#result.layers+1] = "L10:gc=NO_MATCH"
+            end
+        end)
+    end
+    
+    -- ═══════════════════════════════════════════
+    -- BUILD FINAL COMPOSITE SOURCE
+    -- ═══════════════════════════════════════════
+    local parts = {}
+    parts[#parts+1] = "-- ╔═══════════════════════════════════════════════════════════╗"
+    parts[#parts+1] = "-- ║  DECOMPILE FAILED - FALLBACK DATA EXTRACTION             ║"
+    parts[#parts+1] = "-- ╚═══════════════════════════════════════════════════════════╝"
+    parts[#parts+1] = "-- Script: " .. scriptName
+    parts[#parts+1] = "-- Class: " .. scriptObj.ClassName
+    parts[#parts+1] = "-- Error: " .. tostring(result.error)
+    parts[#parts+1] = "-- Extraction Layers: " .. table.concat(result.layers, " → ")
+    if result.hash then
+        parts[#parts+1] = "-- Hash: " .. tostring(result.hash)
+    end
+    if result.bytecodeSize > 0 then
+        parts[#parts+1] = "-- Bytecode Size: " .. result.bytecodeSize .. " bytes"
+    end
+    
+    -- Enabled/RunContext info
+    pcall(function()
+        local enabled = scriptObj.Enabled
+        parts[#parts+1] = "-- Enabled: " .. tostring(enabled)
+    end)
+    pcall(function()
+        local rc = scriptObj.RunContext
+        parts[#parts+1] = "-- RunContext: " .. tostring(rc)
+    end)
+    
+    parts[#parts+1] = ""
+    
+    local hasUsefulData = false
+    
+    -- Add env dump
+    if result.envDump then
+        parts[#parts+1] = result.envDump
+        parts[#parts+1] = ""
+        hasUsefulData = true
+    end
+    
+    -- Add debug info
+    if result.debugInfo and result.debugInfo.lines and #result.debugInfo.lines > 0 then
+        parts[#parts+1] = "-- ═══════════════════════════════════"
+        parts[#parts+1] = "-- DEBUG INFO EXTRACTION"
+        parts[#parts+1] = "-- ═══════════════════════════════════"
+        for _, line in ipairs(result.debugInfo.lines) do
+            parts[#parts+1] = line
+        end
+        parts[#parts+1] = ""
+        hasUsefulData = true
+    end
+    
+    -- Add bytecode
+    if result.bytecodeB64 then
+        parts[#parts+1] = string.format("-- ═══ BYTECODE (%d bytes) ═══", result.bytecodeSize)
+        parts[#parts+1] = "-- Base64 encoded - decode + decompile offline dengan tools external"
+        parts[#parts+1] = "--[[BYTECODE_BASE64_START"
+        -- Split base64 into 76-char lines
+        local b64 = result.bytecodeB64
+        for i = 1, #b64, 76 do
+            parts[#parts+1] = b64:sub(i, i + 75)
+        end
+        parts[#parts+1] = "BYTECODE_BASE64_END]]"
+        parts[#parts+1] = ""
+        hasUsefulData = true
+        
+        if result.bytecodeHex then
+            parts[#parts+1] = "-- ═══ HEX DUMP ═══"
+            parts[#parts+1] = "--[[BYTECODE_HEX_START"
+            parts[#parts+1] = result.bytecodeHex
+            parts[#parts+1] = "BYTECODE_HEX_END]]"
+            parts[#parts+1] = ""
+        end
+    end
+    
+    if not hasUsefulData then
+        DecompileStats.total_failed = DecompileStats.total_failed + 1
+        parts[#parts+1] = "-- ██████████████████████████████████████████"
+        parts[#parts+1] = "-- ██ COMPLETE FAILURE: No data extracted  ██"
+        parts[#parts+1] = "-- ██████████████████████████████████████████"
+        parts[#parts+1] = "-- Possible reasons:"
+        parts[#parts+1] = "--   1. Server-side script (never sent to client)"
+        parts[#parts+1] = "--   2. Script belum di-load/running"
+        parts[#parts+1] = "--   3. Executor tidak support API yang dibutuhkan"
+        parts[#parts+1] = "--   4. Script heavily obfuscated (Luraph/Moonsec/IronBrew)"
+        parts[#parts+1] = "--   5. Bytecode version incompatible"
+        result.method = "failed"
+    else
+        result.method = "fallback_composite"
+    end
+    
+    result.source = table.concat(parts, "\n")
+    
+    -- Track method
+    DecompileStats.methods[scriptName] = result.method
+    
+    return result
+end
+
+
+-- ======================================================================
+-- PART: 03_serializer.lua
+-- ======================================================================
 
 -- ============================================
 -- PROPERTY SERIALIZER - AMBIL SEMUA PROPERTIES
@@ -143,7 +1044,7 @@ local function SerializeValue(val)
         local c = {val:GetComponents()}
         return "CFrame.new(" .. table.concat(c, ", "):sub(1, 200) .. ")"
     elseif t == "Color3" then return string.format("Color3.new(%s, %s, %s)", val.R, val.G, val.B)
-    elseif t == "BrickColor" then return "BrickColor.new(\"" .. tostring(val) .. "\")"
+    elseif t == "BrickColor" then return 'BrickColor.new("' .. tostring(val) .. '")'
     elseif t == "UDim2" then return string.format("UDim2.new(%s, %s, %s, %s)", val.X.Scale, val.X.Offset, val.Y.Scale, val.Y.Offset)
     elseif t == "UDim" then return string.format("UDim.new(%s, %s)", val.Scale, val.Offset)
     elseif t == "Rect" then return string.format("Rect.new(%s, %s, %s, %s)", val.Min.X, val.Min.Y, val.Max.X, val.Max.Y)
@@ -175,7 +1076,7 @@ local ALL_PROPERTIES = {
     -- Animation
     "AnimationId", "Priority", "Speed",
     -- Particle
-    "Rate", "Lifetime", "Speed", "SpreadAngle", "RotSpeed",
+    "Rate", "Lifetime", "SpreadAngle", "RotSpeed",
     "LightEmission", "LightInfluence", "Drag", "VelocityInheritance",
     "Acceleration", "EmissionDirection", "Enabled",
     -- Light
@@ -241,7 +1142,7 @@ local ASSET_PROPERTIES = {
 local function CollectAssets(instance)
     for _, prop in ipairs(ASSET_PROPERTIES) do
         local ok, val = pcall(function() return instance[prop] end)
-        if ok and val and type(val) == "string" and val:find("rbxasset") or (val and tostring(val):find("://")) then
+        if ok and val and type(val) == "string" and (val:find("rbxasset") or val:find("://")) then
             local id = tostring(val)
             if id ~= "" and not assetList[id] then
                 assetList[id] = {
@@ -255,8 +1156,188 @@ local function CollectAssets(instance)
     end
 end
 
+
+-- ======================================================================
+-- PART: 04_scanner.lua
+-- ======================================================================
+
 -- ============================================
--- MAIN DUMPER - TANPA BATASAN
+-- EXTRA SCRIPT DISCOVERY - Tembus Semua
+-- ============================================
+
+-- Discover ALL scripts from every possible source
+local function DiscoverAllScripts()
+    local allScripts = {} -- [instance] = source_method
+    local seen = {}
+    
+    local function addScript(obj, source)
+        if not seen[obj] then
+            seen[obj] = true
+            allScripts[#allScripts+1] = {instance = obj, source = source}
+        end
+    end
+    
+    -- METHOD 1: Standard services descendants scan
+    local servicesToScan = {
+        {Workspace, "Workspace"},
+        {ReplicatedStorage, "ReplicatedStorage"},
+        {ReplicatedFirst, "ReplicatedFirst"},
+        {Lighting, "Lighting"},
+        {StarterGui, "StarterGui"},
+        {StarterPack, "StarterPack"},
+        {StarterPlayer, "StarterPlayer"},
+        {SoundService, "SoundService"},
+        {Teams, "Teams"},
+    }
+    
+    -- Extra services
+    pcall(function() table.insert(servicesToScan, {game:GetService("Chat"), "Chat"}) end)
+    pcall(function() table.insert(servicesToScan, {game:GetService("LocalizationService"), "LocalizationService"}) end)
+    pcall(function() table.insert(servicesToScan, {game:GetService("TestService"), "TestService"}) end)
+    pcall(function() table.insert(servicesToScan, {game:GetService("ServerStorage"), "ServerStorage"}) end)
+    pcall(function() table.insert(servicesToScan, {game:GetService("ServerScriptService"), "ServerScriptService"}) end)
+    
+    for _, svc in ipairs(servicesToScan) do
+        pcall(function()
+            for _, obj in ipairs(svc[1]:GetDescendants()) do
+                if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
+                    addScript(obj, "service:" .. svc[2])
+                end
+            end
+        end)
+    end
+    Log("  Discovery [Services]: " .. #allScripts .. " scripts")
+    
+    -- METHOD 2: Player containers
+    pcall(function()
+        local before = #allScripts
+        for _, child in ipairs(LocalPlayer.PlayerGui:GetDescendants()) do
+            if child:IsA("BaseScript") or child:IsA("ModuleScript") then
+                addScript(child, "PlayerGui")
+            end
+        end
+        Log("  Discovery [PlayerGui]: +" .. (#allScripts - before))
+    end)
+    
+    pcall(function()
+        local before = #allScripts
+        for _, child in ipairs(LocalPlayer.Backpack:GetDescendants()) do
+            if child:IsA("BaseScript") or child:IsA("ModuleScript") then
+                addScript(child, "Backpack")
+            end
+        end
+        Log("  Discovery [Backpack]: +" .. (#allScripts - before))
+    end)
+    
+    pcall(function()
+        local before = #allScripts
+        for _, child in ipairs(LocalPlayer.PlayerScripts:GetDescendants()) do
+            if child:IsA("BaseScript") or child:IsA("ModuleScript") then
+                addScript(child, "PlayerScripts")
+            end
+        end
+        Log("  Discovery [PlayerScripts]: +" .. (#allScripts - before))
+    end)
+    
+    -- METHOD 3: CoreGui
+    pcall(function()
+        local before = #allScripts
+        for _, child in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+            if child:IsA("BaseScript") or child:IsA("ModuleScript") then
+                addScript(child, "CoreGui")
+            end
+        end
+        Log("  Discovery [CoreGui]: +" .. (#allScripts - before))
+    end)
+    
+    -- METHOD 4: getscripts() - ALL scripts in memory
+    pcall(function()
+        if type(getscripts) == "function" then
+            local before = #allScripts
+            for _, obj in ipairs(getscripts()) do
+                if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
+                    addScript(obj, "getscripts()")
+                end
+            end
+            Log("  Discovery [getscripts]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    -- METHOD 5: getrunningscripts() - currently RUNNING scripts
+    pcall(function()
+        if type(getrunningscripts) == "function" then
+            local before = #allScripts
+            for _, obj in ipairs(getrunningscripts()) do
+                addScript(obj, "getrunningscripts()")
+            end
+            Log("  Discovery [getrunningscripts]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    -- METHOD 6: getloadedmodules() - loaded ModuleScripts
+    pcall(function()
+        if type(getloadedmodules) == "function" then
+            local before = #allScripts
+            for _, obj in ipairs(getloadedmodules()) do
+                addScript(obj, "getloadedmodules()")
+            end
+            Log("  Discovery [getloadedmodules]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    -- METHOD 7: getnilinstances() - Hidden/removed scripts (parent = nil)
+    pcall(function()
+        if type(getnilinstances) == "function" then
+            local before = #allScripts
+            for _, obj in ipairs(getnilinstances()) do
+                if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
+                    addScript(obj, "nil_instance")
+                end
+            end
+            Log("  Discovery [nil_instances]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    -- METHOD 8: getinstances() - ALL instances in memory
+    pcall(function()
+        if type(getinstances) == "function" then
+            local before = #allScripts
+            for _, obj in ipairs(getinstances()) do
+                if (obj:IsA("BaseScript") or obj:IsA("ModuleScript")) then
+                    addScript(obj, "getinstances()")
+                end
+            end
+            Log("  Discovery [getinstances]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    -- METHOD 9: getgc() - Scan garbage collector for script closures
+    pcall(function()
+        if type(getgc) == "function" then
+            local before = #allScripts
+            local gcItems = getgc(true) -- include tables
+            for _, item in ipairs(gcItems) do
+                if type(item) == "table" then
+                    pcall(function()
+                        -- Some modules store script references in tables
+                        for k, v in pairs(item) do
+                            if typeof(v) == "Instance" and (v:IsA("BaseScript") or v:IsA("ModuleScript")) then
+                                addScript(v, "gc_table")
+                            end
+                        end
+                    end)
+                end
+            end
+            Log("  Discovery [getgc]: +" .. (#allScripts - before))
+        end
+    end)
+    
+    Log("  TOTAL SCRIPTS DISCOVERED: " .. #allScripts)
+    return allScripts
+end
+
+-- ============================================
+-- MAIN DUMPER - OVERPOWERED EDITION
 -- ============================================
 local function DumpEverything()
     if DUMP_RUNNING then
@@ -271,11 +1352,17 @@ local function DumpEverything()
     totalAssets = 0
     totalFiles = 0
     assetList = {}
+    DecompileStats = {
+        total = 0, decompiled = 0, source_prop = 0,
+        bytecode_saved = 0, env_dumped = 0, closure_decompiled = 0,
+        module_required = 0, debug_extracted = 0, gc_recovered = 0,
+        total_failed = 0, methods = {},
+    }
     
     local gameName, gameId = GetGameInfo()
     local ROOT = "MapRip/" .. gameName .. "_" .. gameId
     
-    Log("=== STARTING FULL MAP RIP ===")
+    Log("=== STARTING ULTIMATE MAP RIP v4.0 ===")
     Log("Game: " .. gameName .. " (ID: " .. gameId .. ")")
     UpdateStatus("Initializing...")
     
@@ -284,6 +1371,10 @@ local function DumpEverything()
     MakeFolder(ROOT .. "/Scripts/LocalScripts")
     MakeFolder(ROOT .. "/Scripts/ServerScripts")
     MakeFolder(ROOT .. "/Scripts/ModuleScripts")
+    MakeFolder(ROOT .. "/Scripts/NilScripts")
+    MakeFolder(ROOT .. "/Scripts/Bytecode")
+    MakeFolder(ROOT .. "/Scripts/Environment")
+    MakeFolder(ROOT .. "/Scripts/DebugInfo")
     MakeFolder(ROOT .. "/Hierarchy")
     MakeFolder(ROOT .. "/Properties")
     MakeFolder(ROOT .. "/Assets")
@@ -293,11 +1384,9 @@ local function DumpEverything()
     MakeFolder(ROOT .. "/Values")
     MakeFolder(ROOT .. "/Animations")
     MakeFolder(ROOT .. "/Terrain")
+    MakeFolder(ROOT .. "/Reports")
     
-    -- ALL containers to scan - TANPA PENGECUALIAN
-    local SCAN_TARGETS = {}
-    
-    -- Add main services
+    -- ALL containers to scan
     local services = {
         {Workspace, "Workspace"},
         {ReplicatedStorage, "ReplicatedStorage"},
@@ -309,8 +1398,6 @@ local function DumpEverything()
         {SoundService, "SoundService"},
         {Teams, "Teams"},
     }
-    
-    -- Try additional services that might be accessible
     pcall(function() table.insert(services, {game:GetService("Chat"), "Chat"}) end)
     pcall(function() table.insert(services, {game:GetService("LocalizationService"), "LocalizationService"}) end)
     pcall(function() table.insert(services, {game:GetService("TestService"), "TestService"}) end)
@@ -327,10 +1414,11 @@ local function DumpEverything()
     local allAnimData = {}
     local allModelData = {}
     local scriptCounter = 0
+    local processedScripts = {} -- track already processed scripts
     
-    -- ========== RECURSIVE SCANNER ==========
+    -- ========== RECURSIVE SCANNER (for hierarchy + assets + non-script data) ==========
     local function ScanRecursive(instance, path, depth, serviceName)
-        if depth > 100 then return end -- safety limit only
+        if depth > 100 then return end
         
         totalInstances = totalInstances + 1
         
@@ -342,55 +1430,96 @@ local function DumpEverything()
         -- Tree line
         local indent = string.rep("│ ", depth)
         local treeEntry = indent .. "├─ [" .. className .. "] " .. instance.Name
-        table.insert(allTreeLines, treeEntry)
+        allTreeLines[#allTreeLines+1] = treeEntry
         
-        -- Collect ALL assets from this instance
+        -- Collect assets
         CollectAssets(instance)
         
-        -- ===== SCRIPTS - Ambil semua =====
-        if instance:IsA("BaseScript") or instance:IsA("ModuleScript") then
+        -- ===== SCRIPTS - Process with UltimateDecompile =====
+        if (instance:IsA("BaseScript") or instance:IsA("ModuleScript")) and not processedScripts[instance] then
+            processedScripts[instance] = true
             totalScripts = totalScripts + 1
             scriptCounter = scriptCounter + 1
             
-            local source = DecompileScript(instance)
+            local decompResult = UltimateDecompile(instance)
+            
             local scriptType = "ServerScripts"
             local ext = ".server.lua"
+            local typeLabel = "Server"
             
             if instance:IsA("LocalScript") then
                 scriptType = "LocalScripts"
                 ext = ".client.lua"
+                typeLabel = "Local"
             elseif instance:IsA("ModuleScript") then
                 scriptType = "ModuleScripts"
                 ext = ".module.lua"
+                typeLabel = "Module"
             end
             
             local header = string.format(
-                "-- =============================================\n" ..
-                "-- Name: %s\n" ..
-                "-- ClassName: %s\n" ..
-                "-- FullPath: %s\n" ..
-                "-- Parent: %s\n" ..
-                "-- Service: %s\n" ..
-                "-- =============================================\n\n",
-                instance.Name, className, fullName,
-                instance.Parent and instance.Parent:GetFullName() or "nil",
-                serviceName
+                "-- ============================================================\n" ..
+                "-- SCRIPT: %s\n" ..
+                "-- TYPE: %s (%s)\n" ..
+                "-- PATH: %s\n" ..
+                "-- PARENT: %s [%s]\n" ..
+                "-- SERVICE: %s\n" ..
+                "-- ENABLED: %s\n" ..
+                "-- METHOD: %s\n" ..
+                "-- LAYERS: %s\n" ..
+                "-- ============================================================\n\n",
+                instance.Name,
+                typeLabel, className,
+                fullName,
+                instance.Parent and instance.Parent.Name or "nil",
+                instance.Parent and instance.Parent.ClassName or "nil",
+                serviceName,
+                tostring(pcall(function() return instance.Enabled end) and (instance.Enabled ~= false) or "N/A"),
+                decompResult.method,
+                table.concat(decompResult.layers or {}, " → ")
             )
             
-            local scriptPath = ROOT .. "/Scripts/" .. scriptType .. "/" .. 
-                string.format("%04d", scriptCounter) .. "_" .. name .. ext
-            SafeWrite(scriptPath, header .. source)
+            -- Save individual script file
+            local fileName = string.format("%04d", scriptCounter) .. "_" .. name .. ext
+            SafeWrite(ROOT .. "/Scripts/" .. scriptType .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
             
-            -- Also store for combined file
-            table.insert(allScriptData, {
+            -- Save bytecode separately if available
+            if decompResult.bytecodeB64 then
+                SafeWrite(ROOT .. "/Scripts/Bytecode/" .. string.format("%04d", scriptCounter) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
+                if decompResult.bytecodeHex then
+                    SafeWrite(ROOT .. "/Scripts/Bytecode/" .. string.format("%04d", scriptCounter) .. "_" .. name .. ".hex", decompResult.bytecodeHex)
+                end
+            end
+            
+            -- Save environment dump separately if available
+            if decompResult.envDump then
+                SafeWrite(ROOT .. "/Scripts/Environment/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_env.lua", decompResult.envDump)
+            end
+            
+            -- Save debug info separately
+            if decompResult.debugInfo and decompResult.debugInfo.lines and #decompResult.debugInfo.lines > 0 then
+                SafeWrite(ROOT .. "/Scripts/DebugInfo/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_debug.txt",
+                    table.concat(decompResult.debugInfo.lines, "\n"))
+            end
+            
+            -- Store for combined file
+            allScriptData[#allScriptData+1] = {
                 name = instance.Name,
                 class = className,
                 path = fullName,
                 service = serviceName,
-                source = source
-            })
+                source = decompResult.source or "-- EMPTY",
+                method = decompResult.method,
+                hash = decompResult.hash,
+            }
             
-            Log("Script #" .. scriptCounter .. ": " .. instance.Name)
+            local icon = "✅"
+            if decompResult.method == "failed" then icon = "❌"
+            elseif decompResult.method == "fallback_composite" then icon = "⚠️"
+            elseif decompResult.method:find("bytecode") then icon = "📦"
+            end
+            
+            Log(icon .. " #" .. scriptCounter .. " [" .. decompResult.method .. "] " .. instance.Name)
         end
         
         -- ===== SOUNDS =====
@@ -402,7 +1531,7 @@ local function DumpEverything()
                 tostring(pcall(function() return instance.Looped end) and instance.Looped or "?"),
                 tostring(pcall(function() return instance.PlaybackSpeed end) and instance.PlaybackSpeed or "?")
             )
-            table.insert(allSoundData, soundInfo)
+            allSoundData[#allSoundData+1] = soundInfo
         end
         
         -- ===== GUI ELEMENTS =====
@@ -412,7 +1541,7 @@ local function DumpEverything()
             for k, v in pairs(props) do
                 guiInfo = guiInfo .. "  " .. k .. " = " .. v .. "\n"
             end
-            table.insert(allGuiData, guiInfo)
+            allGuiData[#allGuiData+1] = guiInfo
         end
         
         -- ===== VALUE OBJECTS =====
@@ -423,7 +1552,7 @@ local function DumpEverything()
                 valOk and tostring(valVal) or "?",
                 fullName
             )
-            table.insert(allValueData, valueInfo)
+            allValueData[#allValueData+1] = valueInfo
         end
         
         -- ===== ANIMATIONS =====
@@ -432,7 +1561,7 @@ local function DumpEverything()
             pcall(function() animId = instance.AnimationId end)
             local animInfo = string.format("[%s] %s\n  Path: %s\n  AnimationId: %s\n",
                 className, instance.Name, fullName, animId)
-            table.insert(allAnimData, animInfo)
+            allAnimData[#allAnimData+1] = animInfo
         end
         
         -- ===== MODELS (BasePart data) =====
@@ -442,30 +1571,29 @@ local function DumpEverything()
             for k, v in pairs(props) do
                 modelInfo = modelInfo .. "  " .. k .. " = " .. v .. "\n"
             end
-            table.insert(allModelData, modelInfo)
+            allModelData[#allModelData+1] = modelInfo
         end
         
-        -- ===== ALL PROPERTIES for everything =====
+        -- ===== ALL PROPERTIES =====
         local propsLine = string.format("\n=== [%s] %s ===\nPath: %s\n", className, instance.Name, fullName)
         local props = GetAllProperties(instance)
         for k, v in pairs(props) do
             propsLine = propsLine .. "  " .. k .. " = " .. v .. "\n"
         end
-        table.insert(allPropertiesData, propsLine)
+        allPropertiesData[#allPropertiesData+1] = propsLine
         
         -- Yield to prevent crash
-        if totalInstances % 200 == 0 then
+        if totalInstances % 150 == 0 then
             task.wait()
             UpdateStatus("Scanning " .. serviceName .. "... (" .. totalInstances .. ")")
             UpdateProgress()
         end
         
-        -- ===== SCAN ALL CHILDREN - TANPA PENGECUALIAN =====
+        -- ===== SCAN CHILDREN =====
         local children = {}
         pcall(function() children = instance:GetChildren() end)
         
         for _, child in ipairs(children) do
-            -- Skip only current player character to avoid self-referencing issues
             local skip = false
             if child == LocalPlayer.Character then skip = true end
             if child:IsA("Camera") and child.Parent == Workspace then skip = true end
@@ -476,47 +1604,42 @@ local function DumpEverything()
         end
     end
     
-    -- ========== START SCANNING ALL SERVICES ==========
+    -- ========== PHASE 1: SCAN ALL SERVICES ==========
+    Log(">>> PHASE 1: Scanning Services...")
     for _, svc in ipairs(services) do
         local container, svcName = svc[1], svc[2]
         Log(">>> Scanning: " .. svcName)
         UpdateStatus("Scanning: " .. svcName)
         
-        table.insert(allTreeLines, "\n" .. string.rep("=", 60))
-        table.insert(allTreeLines, "SERVICE: " .. svcName)
-        table.insert(allTreeLines, string.rep("=", 60))
+        allTreeLines[#allTreeLines+1] = "\n" .. string.rep("=", 60)
+        allTreeLines[#allTreeLines+1] = "SERVICE: " .. svcName
+        allTreeLines[#allTreeLines+1] = string.rep("=", 60)
         
         pcall(function()
-            local children = container:GetChildren()
-            for _, child in ipairs(children) do
+            for _, child in ipairs(container:GetChildren()) do
                 ScanRecursive(child, svcName, 1, svcName)
             end
         end)
     end
     
-    -- ========== ALSO SCAN: game.Players (Backpacks, PlayerGui) ==========
-    Log(">>> Scanning Player data...")
+    -- ========== PHASE 2: SCAN PLAYER DATA ==========
+    Log(">>> PHASE 2: Scanning Player data...")
     UpdateStatus("Scanning Player data...")
     pcall(function()
-        table.insert(allTreeLines, "\n" .. string.rep("=", 60))
-        table.insert(allTreeLines, "PLAYER DATA: " .. LocalPlayer.Name)
-        table.insert(allTreeLines, string.rep("=", 60))
+        allTreeLines[#allTreeLines+1] = "\n" .. string.rep("=", 60)
+        allTreeLines[#allTreeLines+1] = "PLAYER DATA: " .. LocalPlayer.Name
+        allTreeLines[#allTreeLines+1] = string.rep("=", 60)
         
-        -- PlayerGui
         pcall(function()
             for _, child in ipairs(LocalPlayer.PlayerGui:GetChildren()) do
                 ScanRecursive(child, "PlayerGui", 1, "PlayerGui")
             end
         end)
-        
-        -- Backpack
         pcall(function()
             for _, child in ipairs(LocalPlayer.Backpack:GetChildren()) do
                 ScanRecursive(child, "Backpack", 1, "Backpack")
             end
         end)
-        
-        -- PlayerScripts
         pcall(function()
             for _, child in ipairs(LocalPlayer.PlayerScripts:GetChildren()) do
                 ScanRecursive(child, "PlayerScripts", 1, "PlayerScripts")
@@ -524,38 +1647,131 @@ local function DumpEverything()
         end)
     end)
     
-    -- ========== SAVE ALL DATA ==========
+    -- ========== PHASE 3: EXTRA SCRIPT DISCOVERY ==========
+    Log(">>> PHASE 3: Extra Script Discovery (nil/running/gc)...")
+    UpdateStatus("Extra Discovery: nil, running, gc...")
+    
+    local extraScripts = DiscoverAllScripts()
+    local extraFound = 0
+    
+    for _, entry in ipairs(extraScripts) do
+        local obj = entry.instance
+        local discoverySource = entry.source
+        
+        if not processedScripts[obj] then
+            processedScripts[obj] = true
+            extraFound = extraFound + 1
+            totalScripts = totalScripts + 1
+            scriptCounter = scriptCounter + 1
+            
+            local decompResult = UltimateDecompile(obj)
+            
+            local scriptType = "ServerScripts"
+            local ext = ".server.lua"
+            local typeLabel = "Server"
+            
+            if obj:IsA("LocalScript") then
+                scriptType = "LocalScripts"
+                ext = ".client.lua"
+                typeLabel = "Local"
+            elseif obj:IsA("ModuleScript") then
+                scriptType = "ModuleScripts"
+                ext = ".module.lua"
+                typeLabel = "Module"
+            end
+            
+            -- Check if it's a nil instance (hidden script)
+            local isNil = false
+            pcall(function() isNil = obj.Parent == nil end)
+            if isNil then scriptType = "NilScripts" end
+            
+            local fullName = "unknown"
+            pcall(function() fullName = obj:GetFullName() end)
+            
+            local header = string.format(
+                "-- ============================================================\n" ..
+                "-- SCRIPT: %s\n" ..
+                "-- TYPE: %s (%s)\n" ..
+                "-- PATH: %s\n" ..
+                "-- DISCOVERY: %s\n" ..
+                "-- NIL_INSTANCE: %s\n" ..
+                "-- METHOD: %s\n" ..
+                "-- LAYERS: %s\n" ..
+                "-- ============================================================\n\n",
+                obj.Name, typeLabel, obj.ClassName,
+                fullName, discoverySource,
+                tostring(isNil),
+                decompResult.method,
+                table.concat(decompResult.layers or {}, " → ")
+            )
+            
+            local name = SafeName(obj.Name)
+            local fileName = string.format("%04d", scriptCounter) .. "_EXTRA_" .. name .. ext
+            SafeWrite(ROOT .. "/Scripts/" .. scriptType .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
+            
+            if decompResult.bytecodeB64 then
+                SafeWrite(ROOT .. "/Scripts/Bytecode/" .. string.format("%04d", scriptCounter) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
+            end
+            if decompResult.envDump then
+                SafeWrite(ROOT .. "/Scripts/Environment/" .. string.format("%04d", scriptCounter) .. "_" .. name .. "_env.lua", decompResult.envDump)
+            end
+            
+            allScriptData[#allScriptData+1] = {
+                name = obj.Name,
+                class = obj.ClassName,
+                path = fullName,
+                service = "EXTRA:" .. discoverySource,
+                source = decompResult.source or "-- EMPTY",
+                method = decompResult.method,
+                hash = decompResult.hash,
+            }
+            
+            Log("🔍 EXTRA #" .. scriptCounter .. " [" .. discoverySource .. "] " .. obj.Name)
+            
+            if extraFound % 5 == 0 then
+                task.wait()
+                UpdateProgress()
+            end
+        end
+    end
+    Log("Extra scripts found: " .. extraFound)
+    
+    -- ========== PHASE 4: SAVE ALL DATA ==========
     UpdateStatus("Saving all data...")
-    Log("Saving files...")
+    Log(">>> PHASE 4: Saving files...")
     
     -- 1. Full hierarchy tree
     SafeWrite(ROOT .. "/Hierarchy/FULL_TREE.txt", table.concat(allTreeLines, "\n"))
     
-    -- 2. All scripts combined
-    local combinedScripts = "-- ALL SCRIPTS FROM MAP\n-- Game: " .. gameName .. "\n-- Total: " .. #allScriptData .. " scripts\n\n"
+    -- 2. All scripts combined (chunked for large games)
+    local combinedScripts = "-- ALL SCRIPTS FROM MAP - ULTIMATE DUMP v4.0\n-- Game: " .. gameName .. "\n-- Total: " .. #allScriptData .. " scripts\n\n"
+    local chunkNum = 1
     for i, s in ipairs(allScriptData) do
         combinedScripts = combinedScripts .. string.format(
-            "\n\n%s\n-- [%d/%d] %s (%s)\n-- Path: %s\n-- Service: %s\n%s\n",
+            "\n\n%s\n-- [%d/%d] %s (%s) [%s]\n-- Path: %s\n-- Service: %s\n%s\n",
             string.rep("=", 70), i, #allScriptData,
-            s.name, s.class, s.path, s.service,
+            s.name, s.class, s.method, s.path, s.service,
             string.rep("=", 70)
         ) .. s.source
         
-        -- Write in chunks if too large
-        if #combinedScripts > 500000 then
-            local chunkNum = math.floor(i / 100)
+        if #combinedScripts > 400000 then
             SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS_part" .. chunkNum .. ".lua", combinedScripts)
             combinedScripts = ""
+            chunkNum = chunkNum + 1
         end
     end
     if combinedScripts ~= "" then
-        SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS.lua", combinedScripts)
+        if chunkNum > 1 then
+            SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS_part" .. chunkNum .. ".lua", combinedScripts)
+        else
+            SafeWrite(ROOT .. "/Scripts/ALL_SCRIPTS.lua", combinedScripts)
+        end
     end
     
     -- 3. Properties (chunked)
     local propsChunk = ""
     local propsChunkNum = 1
-    for i, p in ipairs(allPropertiesData) do
+    for _, p in ipairs(allPropertiesData) do
         propsChunk = propsChunk .. p
         if #propsChunk > 300000 then
             SafeWrite(ROOT .. "/Properties/properties_" .. string.format("%03d", propsChunkNum) .. ".txt", propsChunk)
@@ -580,11 +1796,11 @@ local function DumpEverything()
         SafeWrite(ROOT .. "/Sounds/ALL_SOUNDS.txt", "ALL SOUNDS\n" .. string.rep("=", 40) .. "\n\n" .. table.concat(allSoundData, "\n" .. string.rep("-", 30) .. "\n"))
     end
     
-    -- 6. GUIs
+    -- 6. GUIs (chunked)
     if #allGuiData > 0 then
         local guiChunk = ""
         local guiChunkNum = 1
-        for i, g in ipairs(allGuiData) do
+        for _, g in ipairs(allGuiData) do
             guiChunk = guiChunk .. g .. "\n"
             if #guiChunk > 300000 then
                 SafeWrite(ROOT .. "/GUIs/gui_data_" .. guiChunkNum .. ".txt", guiChunk)
@@ -607,11 +1823,11 @@ local function DumpEverything()
         SafeWrite(ROOT .. "/Animations/ALL_ANIMATIONS.txt", "ALL ANIMATIONS\n" .. string.rep("=", 40) .. "\n\n" .. table.concat(allAnimData, "\n"))
     end
     
-    -- 9. Models/Parts data (chunked)
+    -- 9. Models/Parts (chunked)
     if #allModelData > 0 then
         local modelChunk = ""
         local modelChunkNum = 1
-        for i, m in ipairs(allModelData) do
+        for _, m in ipairs(allModelData) do
             modelChunk = modelChunk .. m .. "\n"
             if #modelChunk > 300000 then
                 SafeWrite(ROOT .. "/Models/parts_" .. modelChunkNum .. ".txt", modelChunk)
@@ -624,26 +1840,103 @@ local function DumpEverything()
         end
     end
     
-    -- 10. Try saveinstance if available (exports full .rbxl)
+    -- 10. saveinstance with MAXIMUM options
     pcall(function()
         if saveinstance then
-            UpdateStatus("Saving full instance (RBXL)...")
-            Log("Attempting saveinstance...")
+            UpdateStatus("Saving full instance (RBXLX)...")
+            Log("Attempting saveinstance with full options...")
             saveinstance({
                 FilePath = ROOT .. "/FULL_MAP.rbxlx",
-                ExcludePlayerCharacter = true,
-                ExcludePlayerGui = false,
+                Decompile = true,
+                DecompileTimeout = 30,
                 NilInstances = true,
                 RemovePlayerCharacters = true,
+                ExcludePlayerCharacter = true,
+                ExcludePlayerGui = false,
+                IsolateStarterPlayer = false,
+                ShowStatus = true,
+                SaveBytecode = true,
+                mode = "full",
             })
             Log("Full .rbxlx saved!")
         end
     end)
     
-    -- 11. Summary
+    -- 11. DECOMPILE REPORT
+    local reportLines = {}
+    reportLines[#reportLines+1] = "╔═══════════════════════════════════════════════════════════╗"
+    reportLines[#reportLines+1] = "║        DECOMPILE REPORT - ULTIMATE MAP DUMPER v4.0       ║"
+    reportLines[#reportLines+1] = "╚═══════════════════════════════════════════════════════════╝"
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "Game: " .. gameName .. " (ID: " .. gameId .. ")"
+    reportLines[#reportLines+1] = "Date: " .. os.date("%Y-%m-%d %H:%M:%S")
+    reportLines[#reportLines+1] = "Player: " .. LocalPlayer.Name
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "═══ EXECUTOR CAPABILITIES ═══"
+    reportLines[#reportLines+1] = "  decompile:           " .. tostring(HAS_DECOMPILE)
+    reportLines[#reportLines+1] = "  getscriptbytecode:   " .. tostring(HAS_GETSCRIPTBYTECODE)
+    reportLines[#reportLines+1] = "  getscripthash:       " .. tostring(HAS_GETSCRIPTHASH)
+    reportLines[#reportLines+1] = "  getscriptclosure:    " .. tostring(HAS_GETSCRIPTCLOSURE)
+    reportLines[#reportLines+1] = "  getsenv:             " .. tostring(HAS_GETSENV)
+    reportLines[#reportLines+1] = "  getnilinstances:     " .. tostring(HAS_GETNILINSTANCES)
+    reportLines[#reportLines+1] = "  getrunningscripts:   " .. tostring(HAS_GETRUNNINGSCRIPTS)
+    reportLines[#reportLines+1] = "  getloadedmodules:    " .. tostring(HAS_GETLOADEDMODULES)
+    reportLines[#reportLines+1] = "  getgc:               " .. tostring(HAS_GETGC)
+    reportLines[#reportLines+1] = "  getinstances:        " .. tostring(HAS_GETINSTANCES)
+    reportLines[#reportLines+1] = "  debug.getconstants:  " .. tostring(HAS_DEBUG_GETCONSTANTS)
+    reportLines[#reportLines+1] = "  debug.getupvalues:   " .. tostring(HAS_DEBUG_GETUPVALUES)
+    reportLines[#reportLines+1] = "  debug.getprotos:     " .. tostring(HAS_DEBUG_GETPROTOS)
+    reportLines[#reportLines+1] = "  debug.info:          " .. tostring(HAS_DEBUG_GETINFO)
+    reportLines[#reportLines+1] = "  saveinstance:        " .. tostring(type(saveinstance) == "function")
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "═══ STATISTICS ═══"
+    reportLines[#reportLines+1] = "  Total Scripts:          " .. DecompileStats.total
+    reportLines[#reportLines+1] = "  ✅ Decompiled:          " .. DecompileStats.decompiled
+    reportLines[#reportLines+1] = "  ✅ Source Property:      " .. DecompileStats.source_prop
+    reportLines[#reportLines+1] = "  ✅ Closure Decompiled:   " .. DecompileStats.closure_decompiled
+    reportLines[#reportLines+1] = "  ✅ Module Required:      " .. DecompileStats.module_required
+    reportLines[#reportLines+1] = "  ⚠️ Bytecode Saved:      " .. DecompileStats.bytecode_saved
+    reportLines[#reportLines+1] = "  ⚠️ Env Dumped:           " .. DecompileStats.env_dumped
+    reportLines[#reportLines+1] = "  ⚠️ Debug Extracted:      " .. DecompileStats.debug_extracted
+    reportLines[#reportLines+1] = "  ⚠️ GC Recovered:         " .. DecompileStats.gc_recovered
+    reportLines[#reportLines+1] = "  ❌ Total Failed:         " .. DecompileStats.total_failed
+    reportLines[#reportLines+1] = ""
+    
+    local successRate = 0
+    if DecompileStats.total > 0 then
+        local success = DecompileStats.decompiled + DecompileStats.source_prop + DecompileStats.closure_decompiled + DecompileStats.module_required
+        successRate = math.floor(success / DecompileStats.total * 100)
+    end
+    reportLines[#reportLines+1] = "  SUCCESS RATE: " .. successRate .. "%"
+    local dataRate = 0
+    if DecompileStats.total > 0 then
+        dataRate = math.floor((DecompileStats.total - DecompileStats.total_failed) / DecompileStats.total * 100)
+    end
+    reportLines[#reportLines+1] = "  DATA RATE (some data extracted): " .. dataRate .. "%"
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "═══ PER-SCRIPT RESULTS ═══"
+    for scriptPath, method in pairs(DecompileStats.methods) do
+        local icon = "✅"
+        if method == "failed" then icon = "❌"
+        elseif method == "fallback_composite" then icon = "⚠️"
+        elseif method:find("bytecode") then icon = "📦"
+        end
+        reportLines[#reportLines+1] = "  " .. icon .. " [" .. method .. "] " .. scriptPath
+    end
+    reportLines[#reportLines+1] = ""
+    reportLines[#reportLines+1] = "═══ GENERAL STATS ═══"
+    reportLines[#reportLines+1] = "  Total Instances Scanned: " .. totalInstances
+    reportLines[#reportLines+1] = "  Total Scripts Found:     " .. totalScripts
+    reportLines[#reportLines+1] = "  Extra Scripts (hidden):  " .. extraFound
+    reportLines[#reportLines+1] = "  Total Assets:            " .. totalAssets
+    reportLines[#reportLines+1] = "  Total Files Written:     " .. totalFiles
+    
+    SafeWrite(ROOT .. "/Reports/DECOMPILE_REPORT.txt", table.concat(reportLines, "\n"))
+    
+    -- 12. Summary
     local summary = string.format([[
 ================================================================
-           ULTIMATE MAP RIP - COMPLETE SUMMARY
+         ULTIMATE MAP RIP v4.0 - COMPLETE SUMMARY
 ================================================================
 
 Game Name     : %s
@@ -653,85 +1946,346 @@ Date          : %s
 Dumped By     : %s
 
 ================================================================
-                        STATISTICS
+                    DECOMPILE STATISTICS
+================================================================
+
+Total Scripts         : %d
+Decompiled OK         : %d
+Source Property        : %d  
+Closure Decompiled    : %d
+Module Required       : %d
+Bytecode Saved        : %d
+Env Dumped            : %d
+Debug Extracted       : %d
+GC Recovered          : %d
+Total Failed          : %d
+SUCCESS RATE          : %d%%
+DATA RATE             : %d%%
+
+================================================================
+                     GENERAL STATISTICS
 ================================================================
 
 Total Instances Scanned  : %d
-Total Scripts Found      : %d  
+Total Scripts Found      : %d
+Extra Scripts (hidden)   : %d
 Total Unique Assets      : %d
 Total Files Written      : %d
 
 ================================================================
-                     OUTPUT STRUCTURE
+                    OUTPUT STRUCTURE
 ================================================================
 
 📁 %s/
 ├── 📁 Scripts/
-│   ├── 📁 LocalScripts/     (client scripts .client.lua)
-│   ├── 📁 ServerScripts/    (server scripts .server.lua)
-│   ├── 📁 ModuleScripts/    (modules .module.lua)
-│   └── 📄 ALL_SCRIPTS.lua   (semua script digabung 1 file)
+│   ├── 📁 LocalScripts/     (.client.lua)
+│   ├── 📁 ServerScripts/    (.server.lua)
+│   ├── 📁 ModuleScripts/    (.module.lua)
+│   ├── 📁 NilScripts/       (hidden scripts, parent=nil)
+│   ├── 📁 Bytecode/         (.b64 & .hex files)
+│   ├── 📁 Environment/      (getsenv dumps)
+│   ├── 📁 DebugInfo/        (constants/upvalues/protos)
+│   └── 📄 ALL_SCRIPTS*.lua  (combined)
 ├── 📁 Hierarchy/
-│   └── 📄 FULL_TREE.txt     (complete game tree structure)
 ├── 📁 Properties/
-│   └── 📄 properties_*.txt  (semua properties tiap instance)
 ├── 📁 Assets/
-│   └── 📄 ALL_ASSETS.txt    (semua asset IDs: mesh, texture, sound, dll)
 ├── 📁 Models/
-│   └── 📄 parts_*.txt       (semua BasePart data + positions)
 ├── 📁 Sounds/
-│   └── 📄 ALL_SOUNDS.txt    (semua Sound objects + IDs)
 ├── 📁 GUIs/
-│   └── 📄 gui_data_*.txt    (semua GUI elements + properties)
 ├── 📁 Values/
-│   └── 📄 ALL_VALUES.txt    (semua ValueBase objects)
 ├── 📁 Animations/
-│   └── 📄 ALL_ANIMATIONS.txt (semua Animation IDs)
-├── 📁 Terrain/
-│   └── (terrain data if available)
-└── 📄 SUMMARY.txt           (this file)
-
-================================================================
-                     FILE LOCATIONS
-================================================================
-
-Delta Executor:
-  /storage/emulated/0/Delta/workspace/%s/
-
-Fluxus:
-  /storage/emulated/0/Fluxus/workspace/%s/
-
-Arceus X:
-  /storage/emulated/0/ArceusX/workspace/%s/
-
-Hydrogen:  
-  /storage/emulated/0/Hydrogen/workspace/%s/
-
-================================================================
-                         NOTES
-================================================================
-
-- Semua file termasuk yang punya nama acak/random sudah diambil
-- Script di-decompile otomatis (jika executor support)
-- Tidak ada filter - SEMUA instance diambil tanpa pengecualian
-- File besar di-split jadi beberapa chunk agar tidak crash
+├── 📁 Reports/
+│   └── 📄 DECOMPILE_REPORT.txt
+└── 📄 SUMMARY.txt
 
 ================================================================
 ]], 
     gameName, game.PlaceId, game.GameId, os.date("%Y-%m-%d %H:%M:%S"), LocalPlayer.Name,
-    totalInstances, totalScripts, totalAssets, totalFiles,
-    ROOT, ROOT, ROOT, ROOT, ROOT)
+    DecompileStats.total, DecompileStats.decompiled, DecompileStats.source_prop,
+    DecompileStats.closure_decompiled, DecompileStats.module_required,
+    DecompileStats.bytecode_saved, DecompileStats.env_dumped,
+    DecompileStats.debug_extracted, DecompileStats.gc_recovered,
+    DecompileStats.total_failed, successRate, dataRate,
+    totalInstances, totalScripts, extraFound, totalAssets, totalFiles,
+    ROOT)
     
     SafeWrite(ROOT .. "/SUMMARY.txt", summary)
     
     -- Done!
     Log("=== RIP COMPLETE ===")
-    Log("Total: " .. totalInstances .. " instances, " .. totalScripts .. " scripts, " .. totalFiles .. " files")
-    UpdateStatus("✅ COMPLETE! " .. totalFiles .. " files saved!")
+    Log(string.format("Total: %d instances, %d scripts (%d%% success), %d files", 
+        totalInstances, totalScripts, successRate, totalFiles))
+    UpdateStatus("✅ COMPLETE! " .. totalFiles .. " files | " .. successRate .. "% decompiled")
     UpdateProgress()
     
     DUMP_RUNNING = false
     return ROOT
+end
+
+
+-- ======================================================================
+-- PART: 05_gui.lua
+-- ======================================================================
+
+-- ============================================
+-- SCRIPTS ONLY DEEP DUMP (Enhanced)
+-- ============================================
+local function ScriptsOnlyDump()
+    if DUMP_RUNNING then return end
+    DUMP_RUNNING = true
+    
+    local gameName, gameId = GetGameInfo()
+    local ROOT = "MapRip/" .. gameName .. "_" .. gameId .. "_SCRIPTS_ONLY"
+    MakeFolder(ROOT)
+    MakeFolder(ROOT .. "/LocalScripts")
+    MakeFolder(ROOT .. "/ServerScripts")
+    MakeFolder(ROOT .. "/ModuleScripts")
+    MakeFolder(ROOT .. "/NilScripts")
+    MakeFolder(ROOT .. "/Bytecode")
+    MakeFolder(ROOT .. "/Environment")
+    MakeFolder(ROOT .. "/ByFolder")
+    
+    -- Reset stats
+    DecompileStats = {
+        total = 0, decompiled = 0, source_prop = 0,
+        bytecode_saved = 0, env_dumped = 0, closure_decompiled = 0,
+        module_required = 0, debug_extracted = 0, gc_recovered = 0,
+        total_failed = 0, methods = {},
+    }
+    
+    local scriptCount = 0
+    local localCount = 0
+    local serverCount = 0
+    local moduleCount = 0
+    local fileCount = 0
+    
+    local folderScripts = {}
+    
+    Log("=== ULTIMATE SCRIPTS DUMP ===")
+    Log("Using 10+ layer decompile fallback")
+    UpdateStatus("Discovering ALL scripts...")
+    
+    -- Use DiscoverAllScripts for maximum coverage
+    local allScripts = DiscoverAllScripts()
+    local total = #allScripts
+    
+    Log("Found " .. total .. " scripts total. Starting extraction...")
+    
+    for idx, entry in ipairs(allScripts) do
+        local obj = entry.instance
+        local discoverySource = entry.source
+        
+        scriptCount = scriptCount + 1
+        
+        UpdateStatus(string.format("Decompiling %d/%d: %s", idx, total, obj.Name))
+        
+        local decompResult = UltimateDecompile(obj)
+        local name = SafeName(obj.Name)
+        local fullPath = "unknown"
+        pcall(function() fullPath = obj:GetFullName() end)
+        
+        local folder = "ServerScripts"
+        local ext = ".server.lua"
+        local typeLabel = "Server"
+        
+        if obj:IsA("LocalScript") then
+            folder = "LocalScripts"
+            ext = ".client.lua"
+            typeLabel = "Local"
+            localCount = localCount + 1
+        elseif obj:IsA("ModuleScript") then
+            folder = "ModuleScripts"
+            ext = ".module.lua"
+            typeLabel = "Module"
+            moduleCount = moduleCount + 1
+        else
+            serverCount = serverCount + 1
+        end
+        
+        -- Check nil instance
+        local isNil = false
+        pcall(function() isNil = obj.Parent == nil end)
+        if isNil then folder = "NilScripts" end
+        
+        -- Header
+        local header = string.format(
+            "-- ============================================================\n" ..
+            "-- SCRIPT: %s\n" ..
+            "-- TYPE: %s (%s)\n" ..
+            "-- PATH: %s\n" ..
+            "-- PARENT: %s [%s]\n" ..
+            "-- DISCOVERY: %s\n" ..
+            "-- NIL_INSTANCE: %s\n" ..
+            "-- METHOD: %s\n" ..
+            "-- ENABLED: %s\n" ..
+            "-- LAYERS: %s\n" ..
+            "-- ============================================================\n\n",
+            obj.Name, typeLabel, obj.ClassName,
+            fullPath,
+            obj.Parent and obj.Parent.Name or "nil",
+            obj.Parent and obj.Parent.ClassName or "nil",
+            discoverySource,
+            tostring(isNil),
+            decompResult.method,
+            tostring(pcall(function() return obj.Enabled end) and (obj.Enabled ~= false) or "N/A"),
+            table.concat(decompResult.layers or {}, " → ")
+        )
+        
+        -- Save individual
+        local fileName = string.format("%04d", scriptCount) .. "_" .. name .. ext
+        SafeWrite(ROOT .. "/" .. folder .. "/" .. fileName, header .. (decompResult.source or "-- EMPTY"))
+        fileCount = fileCount + 1
+        
+        -- Save bytecode
+        if decompResult.bytecodeB64 then
+            SafeWrite(ROOT .. "/Bytecode/" .. string.format("%04d", scriptCount) .. "_" .. name .. ".b64", decompResult.bytecodeB64)
+            fileCount = fileCount + 1
+        end
+        
+        -- Save env
+        if decompResult.envDump then
+            SafeWrite(ROOT .. "/Environment/" .. string.format("%04d", scriptCount) .. "_" .. name .. "_env.lua", decompResult.envDump)
+            fileCount = fileCount + 1
+        end
+        
+        -- Organize by parent folder
+        local svcName = discoverySource:match("service:(.+)") or discoverySource
+        local folderKey = SafeName(svcName .. "/" .. (obj.Parent and obj.Parent.Name or "root"))
+        if not folderScripts[folderKey] then
+            folderScripts[folderKey] = {}
+        end
+        folderScripts[folderKey][#folderScripts[folderKey]+1] = {
+            name = obj.Name,
+            class = obj.ClassName,
+            path = fullPath,
+            source = decompResult.source or "-- EMPTY",
+            header = header,
+            method = decompResult.method,
+        }
+        
+        local icon = "✅"
+        if decompResult.method == "failed" then icon = "❌"
+        elseif decompResult.method == "fallback_composite" then icon = "⚠️" end
+        
+        Log(icon .. " [" .. typeLabel .. "] " .. obj.Name .. " ← " .. discoverySource)
+        
+        if scriptCount % 3 == 0 then
+            task.wait(0.1)
+            UpdateProgress()
+        end
+        if scriptCount % 15 == 0 then
+            task.wait(0.3)
+        end
+    end
+    
+    -- Save organized by folder
+    UpdateStatus("Saving by folder structure...")
+    for folderKey, scripts in pairs(folderScripts) do
+        local folderPath = ROOT .. "/ByFolder/" .. folderKey
+        MakeFolder(folderPath)
+        for i, s in ipairs(scripts) do
+            local fext = ".lua"
+            if s.class == "LocalScript" then fext = ".client.lua"
+            elseif s.class == "ModuleScript" then fext = ".module.lua"
+            else fext = ".server.lua" end
+            SafeWrite(folderPath .. "/" .. SafeName(s.name) .. "_" .. i .. fext, s.header .. s.source)
+            fileCount = fileCount + 1
+        end
+    end
+    
+    -- Save combined
+    UpdateStatus("Saving combined file...")
+    local combined = string.format(
+        "-- ============================================================\n" ..
+        "-- ALL GAME SCRIPTS - ULTIMATE DUMP v4.0\n" ..
+        "-- Game: %s (ID: %d)\n" ..
+        "-- Total Scripts: %d (Local: %d, Server: %d, Module: %d)\n" ..
+        "-- Date: %s\n" ..
+        "-- Decompile Rate: %d%% full | %d%% with data\n" ..
+        "-- ============================================================\n\n",
+        gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
+        os.date("%Y-%m-%d %H:%M:%S"),
+        DecompileStats.total > 0 and math.floor((DecompileStats.decompiled + DecompileStats.source_prop) / DecompileStats.total * 100) or 0,
+        DecompileStats.total > 0 and math.floor((DecompileStats.total - DecompileStats.total_failed) / DecompileStats.total * 100) or 0
+    )
+    
+    local partNum = 1
+    for folderKey, scripts in pairs(folderScripts) do
+        combined = combined .. "\n\n" .. string.rep("=", 70) .. "\n"
+        combined = combined .. "-- FOLDER: " .. folderKey .. " (" .. #scripts .. " scripts)\n"
+        combined = combined .. string.rep("=", 70) .. "\n"
+        for _, s in ipairs(scripts) do
+            combined = combined .. "\n" .. s.header .. s.source .. "\n"
+        end
+        if #combined > 600000 then
+            SafeWrite(ROOT .. "/ALL_SCRIPTS_combined_part" .. partNum .. ".lua", combined)
+            fileCount = fileCount + 1
+            combined = ""
+            partNum = partNum + 1
+        end
+    end
+    if combined ~= "" then
+        SafeWrite(ROOT .. "/ALL_SCRIPTS_combined.lua", combined)
+        fileCount = fileCount + 1
+    end
+    
+    -- Save index
+    local successRate = DecompileStats.total > 0 and math.floor((DecompileStats.decompiled + DecompileStats.source_prop + DecompileStats.closure_decompiled + DecompileStats.module_required) / DecompileStats.total * 100) or 0
+    
+    local indexText = string.format(
+        "ULTIMATE SCRIPTS DUMP - INDEX\n" ..
+        string.rep("=", 60) .. "\n" ..
+        "Game: %s (ID: %d)\n" ..
+        "Total Scripts: %d\n" ..
+        "  LocalScripts: %d\n" ..
+        "  ServerScripts: %d\n" ..
+        "  ModuleScripts: %d\n" ..
+        "Decompile Success Rate: %d%%\n" ..
+        "  Decompiled: %d\n" ..
+        "  Source Property: %d\n" ..
+        "  Closure Decompiled: %d\n" ..
+        "  Module Required: %d\n" ..
+        "  Bytecode Saved: %d\n" ..
+        "  Env Dumped: %d\n" ..
+        "  Debug Extracted: %d\n" ..
+        "  GC Recovered: %d\n" ..
+        "  Failed: %d\n" ..
+        "Date: %s\n\n" ..
+        string.rep("=", 60) .. "\n" ..
+        "FOLDER STRUCTURE:\n" ..
+        string.rep("=", 60) .. "\n\n",
+        gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
+        successRate,
+        DecompileStats.decompiled, DecompileStats.source_prop,
+        DecompileStats.closure_decompiled, DecompileStats.module_required,
+        DecompileStats.bytecode_saved, DecompileStats.env_dumped,
+        DecompileStats.debug_extracted, DecompileStats.gc_recovered,
+        DecompileStats.total_failed,
+        os.date("%Y-%m-%d %H:%M:%S")
+    )
+    
+    for folderKey, scripts in pairs(folderScripts) do
+        indexText = indexText .. "\n📁 " .. folderKey .. "/ (" .. #scripts .. " scripts)\n"
+        for i, s in ipairs(scripts) do
+            local icon = "✅"
+            if s.method == "failed" then icon = "❌"
+            elseif s.method == "fallback_composite" then icon = "⚠️" end
+            indexText = indexText .. "  " .. icon .. " " .. i .. ". [" .. s.class .. "] " .. s.name .. " (" .. s.method .. ")\n"
+            indexText = indexText .. "     Path: " .. s.path .. "\n"
+        end
+    end
+    
+    SafeWrite(ROOT .. "/INDEX.txt", indexText)
+    fileCount = fileCount + 1
+    
+    Log("=== SCRIPTS DUMP COMPLETE ===")
+    Log(string.format("Found %d scripts (L:%d S:%d M:%d) | Success: %d%%",
+        scriptCount, localCount, serverCount, moduleCount, successRate))
+    Log("Saved to: workspace/" .. ROOT)
+    UpdateStatus("✅ " .. scriptCount .. " scripts | " .. successRate .. "% decompiled | " .. fileCount .. " files")
+    
+    DUMP_RUNNING = false
+    return ROOT, scriptCount, fileCount, successRate
 end
 
 -- ============================================
@@ -750,21 +2304,21 @@ local function CreateGUI()
     -- Main Frame
     local Main = Instance.new("Frame")
     Main.Name = "Main"
-    Main.Size = UDim2.new(0.92, 0, 0.75, 0)
-    Main.Position = UDim2.new(0.04, 0, 0.12, 0)
-    Main.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+    Main.Size = UDim2.new(0.92, 0, 0.78, 0)
+    Main.Position = UDim2.new(0.04, 0, 0.10, 0)
+    Main.BackgroundColor3 = Color3.fromRGB(12, 12, 22)
     Main.BorderSizePixel = 0
     Main.Parent = Gui
     
     Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 14)
     local stroke = Instance.new("UIStroke", Main)
-    stroke.Color = Color3.fromRGB(130, 50, 255)
+    stroke.Color = Color3.fromRGB(180, 50, 255)
     stroke.Thickness = 2
     
     -- Title
     local Title = Instance.new("Frame")
     Title.Size = UDim2.new(1, 0, 0, 48)
-    Title.BackgroundColor3 = Color3.fromRGB(25, 15, 50)
+    Title.BackgroundColor3 = Color3.fromRGB(25, 10, 55)
     Title.BorderSizePixel = 0
     Title.Parent = Main
     Instance.new("UICorner", Title).CornerRadius = UDim.new(0, 14)
@@ -772,17 +2326,17 @@ local function CreateGUI()
     local TitleFix = Instance.new("Frame")
     TitleFix.Size = UDim2.new(1, 0, 0, 14)
     TitleFix.Position = UDim2.new(0, 0, 1, -14)
-    TitleFix.BackgroundColor3 = Color3.fromRGB(25, 15, 50)
+    TitleFix.BackgroundColor3 = Color3.fromRGB(25, 10, 55)
     TitleFix.BorderSizePixel = 0
     TitleFix.Parent = Title
     
     local TitleText = Instance.new("TextLabel")
-    TitleText.Text = "💀 ULTIMATE MAP RIPPER v3.0"
-    TitleText.Size = UDim2.new(0.75, 0, 1, 0)
-    TitleText.Position = UDim2.new(0.05, 0, 0, 0)
+    TitleText.Text = "💀 ULTIMATE MAP RIPPER v4.0 OP"
+    TitleText.Size = UDim2.new(0.70, 0, 1, 0)
+    TitleText.Position = UDim2.new(0.03, 0, 0, 0)
     TitleText.BackgroundTransparency = 1
-    TitleText.TextColor3 = Color3.fromRGB(220, 150, 255)
-    TitleText.TextSize = 16
+    TitleText.TextColor3 = Color3.fromRGB(230, 140, 255)
+    TitleText.TextSize = 15
     TitleText.Font = Enum.Font.GothamBold
     TitleText.TextXAlignment = Enum.TextXAlignment.Left
     TitleText.Parent = Title
@@ -820,8 +2374,8 @@ local function CreateGUI()
     Content.BackgroundTransparency = 1
     Content.BorderSizePixel = 0
     Content.ScrollBarThickness = 4
-    Content.ScrollBarImageColor3 = Color3.fromRGB(130, 50, 255)
-    Content.CanvasSize = UDim2.new(0, 0, 0, 850)
+    Content.ScrollBarImageColor3 = Color3.fromRGB(180, 50, 255)
+    Content.CanvasSize = UDim2.new(0, 0, 0, 1000)
     Content.Parent = Main
     
     local Layout = Instance.new("UIListLayout")
@@ -831,7 +2385,7 @@ local function CreateGUI()
     
     -- Game info
     local gameInfo = Instance.new("TextLabel")
-    gameInfo.Text = "🎮 Place ID: " .. game.PlaceId .. " | Game ID: " .. game.GameId
+    gameInfo.Text = "🎮 Place: " .. game.PlaceId .. " | Game: " .. game.GameId
     gameInfo.Size = UDim2.new(1, 0, 0, 22)
     gameInfo.BackgroundTransparency = 1
     gameInfo.TextColor3 = Color3.fromRGB(170, 170, 200)
@@ -840,37 +2394,56 @@ local function CreateGUI()
     gameInfo.LayoutOrder = 1
     gameInfo.Parent = Content
     
+    -- Executor capabilities
+    local capText = "🔧 "
+    if HAS_DECOMPILE then capText = capText .. "decompile ✅ " else capText = capText .. "decompile ❌ " end
+    if HAS_GETSENV then capText = capText .. "getsenv ✅ " else capText = capText .. "getsenv ❌ " end
+    if HAS_GETSCRIPTBYTECODE then capText = capText .. "bytecode ✅ " else capText = capText .. "bytecode ❌ " end
+    if HAS_GETNILINSTANCES then capText = capText .. "nil ✅" else capText = capText .. "nil ❌" end
+    
+    local capLabel = Instance.new("TextLabel")
+    capLabel.Text = capText
+    capLabel.Size = UDim2.new(1, 0, 0, 18)
+    capLabel.BackgroundTransparency = 1
+    capLabel.TextColor3 = Color3.fromRGB(140, 140, 170)
+    capLabel.TextSize = 9
+    capLabel.Font = Enum.Font.Code
+    capLabel.TextWrapped = true
+    capLabel.LayoutOrder = 2
+    capLabel.Parent = Content
+    
     -- Status
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Text = "⏸️ Ready - Tekan tombol untuk mulai"
+    statusLabel.Text = "⏸️ Ready - 10+ decompile layers active"
     statusLabel.Size = UDim2.new(1, 0, 0, 28)
     statusLabel.BackgroundColor3 = Color3.fromRGB(20, 30, 20)
     statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
-    statusLabel.TextSize = 12
+    statusLabel.TextSize = 11
     statusLabel.Font = Enum.Font.GothamBold
-    statusLabel.LayoutOrder = 2
+    statusLabel.LayoutOrder = 3
     statusLabel.Parent = Content
     Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 6)
     
     -- Progress
     progressLabel = Instance.new("TextLabel")
-    progressLabel.Text = "Instances: 0 | Scripts: 0 | Assets: 0 | Files: 0"
-    progressLabel.Size = UDim2.new(1, 0, 0, 20)
+    progressLabel.Text = "Inst: 0 | Scripts: 0 | Assets: 0 | Files: 0 | OK: 0 | Fail: 0"
+    progressLabel.Size = UDim2.new(1, 0, 0, 18)
     progressLabel.BackgroundTransparency = 1
     progressLabel.TextColor3 = Color3.fromRGB(150, 150, 180)
-    progressLabel.TextSize = 10
+    progressLabel.TextSize = 9
     progressLabel.Font = Enum.Font.Code
-    progressLabel.LayoutOrder = 3
+    progressLabel.TextWrapped = true
+    progressLabel.LayoutOrder = 4
     progressLabel.Parent = Content
     
     -- Helper function for buttons
     local function MakeButton(text, color, order)
         local btn = Instance.new("TextButton")
         btn.Text = text
-        btn.Size = UDim2.new(1, 0, 0, 48)
+        btn.Size = UDim2.new(1, 0, 0, 46)
         btn.BackgroundColor3 = color
         btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.TextSize = 14
+        btn.TextSize = 13
         btn.Font = Enum.Font.GothamBold
         btn.BorderSizePixel = 0
         btn.LayoutOrder = order
@@ -880,9 +2453,9 @@ local function CreateGUI()
     end
     
     -- Buttons
-    local DumpAllBtn = MakeButton("⬇️ RIP EVERYTHING (Semua tanpa pengecualian)", Color3.fromRGB(130, 30, 200), 10)
-    local ScriptsDeepBtn = MakeButton("📜 SCRIPTS ONLY (Logic Game, Skip Assets)", Color3.fromRGB(220, 120, 0), 11)
-    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx) - If Supported", Color3.fromRGB(200, 100, 30), 12)
+    local DumpAllBtn = MakeButton("⬇️ RIP EVERYTHING (10+ Layer Decompile)", Color3.fromRGB(140, 20, 220), 10)
+    local ScriptsDeepBtn = MakeButton("📜 SCRIPTS ONLY (Maximum Extraction)", Color3.fromRGB(220, 100, 0), 11)
+    local SaveInstanceBtn = MakeButton("💾 SAVE FULL MAP (.rbxlx) - Advanced Options", Color3.fromRGB(200, 80, 30), 12)
     local ClipboardBtn = MakeButton("📋 COPY ALL SCRIPTS TO CLIPBOARD", Color3.fromRGB(30, 130, 80), 13)
     local TreeOnlyBtn = MakeButton("🌳 EXPORT TREE STRUCTURE ONLY", Color3.fromRGB(30, 80, 150), 14)
     
@@ -894,13 +2467,13 @@ local function CreateGUI()
     sep.LayoutOrder = 15
     sep.Parent = Content
     
-    -- Location info
+    -- Info labels
     local locInfo = Instance.new("TextLabel")
-    locInfo.Text = "📁 Output: /sdcard/[Executor]/workspace/MapRip/\n📱 Buka File Manager → Internal → Delta/workspace/"
-    locInfo.Size = UDim2.new(1, 0, 0, 40)
-    locInfo.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
-    locInfo.TextColor3 = Color3.fromRGB(255, 200, 80)
-    locInfo.TextSize = 10
+    locInfo.Text = "📁 Output: /sdcard/[Executor]/workspace/MapRip/\n🔥 10+ fallback layers: source→decompile→closure→getsenv→require→bytecode→debug→gc"
+    locInfo.Size = UDim2.new(1, 0, 0, 45)
+    locInfo.BackgroundColor3 = Color3.fromRGB(25, 20, 40)
+    locInfo.TextColor3 = Color3.fromRGB(255, 190, 70)
+    locInfo.TextSize = 9
     locInfo.Font = Enum.Font.Gotham
     locInfo.TextWrapped = true
     locInfo.LayoutOrder = 16
@@ -909,10 +2482,10 @@ local function CreateGUI()
     
     -- Log box
     logBox = Instance.new("TextLabel")
-    logBox.Text = "[Ready] Logs appear here...\n"
-    logBox.Size = UDim2.new(1, 0, 0, 250)
-    logBox.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
-    logBox.TextColor3 = Color3.fromRGB(130, 255, 130)
+    logBox.Text = "[Ready] v4.0 OP Edition loaded\n"
+    logBox.Size = UDim2.new(1, 0, 0, 280)
+    logBox.BackgroundColor3 = Color3.fromRGB(8, 8, 16)
+    logBox.TextColor3 = Color3.fromRGB(120, 255, 120)
     logBox.TextSize = 9
     logBox.Font = Enum.Font.Code
     logBox.TextWrapped = true
@@ -927,7 +2500,7 @@ local function CreateGUI()
     lp.PaddingLeft = UDim.new(0, 4)
     lp.PaddingRight = UDim.new(0, 4)
     
-    -- ===== DRAGGING (Touch + Mouse) =====
+    -- ===== DRAGGING =====
     local dragging, dragStart, startPos = false, nil, nil
     
     Title.InputBegan:Connect(function(input)
@@ -958,13 +2531,13 @@ local function CreateGUI()
     MinBtn.MouseButton1Click:Connect(function()
         minimized = not minimized
         Content.Visible = not minimized
-        Main.Size = minimized and UDim2.new(0.92, 0, 0, 48) or UDim2.new(0.92, 0, 0.75, 0)
+        Main.Size = minimized and UDim2.new(0.92, 0, 0, 48) or UDim2.new(0.92, 0, 0.78, 0)
         MinBtn.Text = minimized and "□" or "—"
     end)
     
     DumpAllBtn.MouseButton1Click:Connect(function()
         if DUMP_RUNNING then return end
-        DumpAllBtn.Text = "⏳ RIPPING MAP..."
+        DumpAllBtn.Text = "⏳ RIPPING MAP (10+ layers)..."
         DumpAllBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
         
         task.spawn(function()
@@ -972,317 +2545,82 @@ local function CreateGUI()
             DumpAllBtn.Text = "✅ DONE! " .. totalFiles .. " files → workspace/" .. (folder or "MapRip")
             DumpAllBtn.BackgroundColor3 = Color3.fromRGB(30, 160, 30)
             task.wait(5)
-            DumpAllBtn.Text = "⬇️ RIP EVERYTHING (Semua tanpa pengecualian)"
-            DumpAllBtn.BackgroundColor3 = Color3.fromRGB(130, 30, 200)
+            DumpAllBtn.Text = "⬇️ RIP EVERYTHING (10+ Layer Decompile)"
+            DumpAllBtn.BackgroundColor3 = Color3.fromRGB(140, 20, 220)
         end)
     end)
     
-    -- ===== SCRIPTS ONLY DEEP DUMP (Skip all assets, only grab logic/code) =====
     ScriptsDeepBtn.MouseButton1Click:Connect(function()
         if DUMP_RUNNING then return end
-        DUMP_RUNNING = true
-        ScriptsDeepBtn.Text = "⏳ EXTRACTING SCRIPTS..."
+        ScriptsDeepBtn.Text = "⏳ EXTRACTING ALL SCRIPTS..."
         ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
         
         task.spawn(function()
-            local gameName, gameId = GetGameInfo()
-            local ROOT = "MapRip/" .. gameName .. "_" .. gameId .. "_SCRIPTS_ONLY"
-            MakeFolder(ROOT)
-            MakeFolder(ROOT .. "/LocalScripts")
-            MakeFolder(ROOT .. "/ServerScripts")
-            MakeFolder(ROOT .. "/ModuleScripts")
-            MakeFolder(ROOT .. "/ByFolder")
-            
-            local scriptCount = 0
-            local localCount = 0
-            local serverCount = 0
-            local moduleCount = 0
-            local fileCount = 0
-            local scannedInstances = 0
-            
-            -- Organized by parent folder path
-            local folderScripts = {} -- [folderPath] = {scripts...}
-            
-            Log("=== SCRIPTS ONLY DUMP ===")
-            Log("Skipping: Sound, Texture, Decal, Image, MeshPart geometry, Particles, etc")
-            Log("Grabbing: ALL LocalScript, Script, ModuleScript")
-            UpdateStatus("Scanning for scripts...")
-            
-            local allServices = {
-                {Workspace, "Workspace"},
-                {ReplicatedStorage, "ReplicatedStorage"},
-                {ReplicatedFirst, "ReplicatedFirst"},
-                {Lighting, "Lighting"},
-                {StarterGui, "StarterGui"},
-                {StarterPack, "StarterPack"},
-                {StarterPlayer, "StarterPlayer"},
-                {SoundService, "SoundService"},
-                {Teams, "Teams"},
-            }
-            pcall(function() table.insert(allServices, {game:GetService("Chat"), "Chat"}) end)
-            pcall(function() table.insert(allServices, {LocalPlayer.PlayerGui, "PlayerGui"}) end)
-            pcall(function() table.insert(allServices, {LocalPlayer.PlayerScripts, "PlayerScripts"}) end)
-            pcall(function() table.insert(allServices, {LocalPlayer.Backpack, "Backpack"}) end)
-            
-            for _, svcInfo in ipairs(allServices) do
-                local container, svcName = svcInfo[1], svcInfo[2]
-                UpdateStatus("Scanning: " .. svcName)
-                
-                pcall(function()
-                    local descendants = container:GetDescendants()
-                    for _, obj in ipairs(descendants) do
-                        scannedInstances = scannedInstances + 1
-                        
-                        if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
-                            scriptCount = scriptCount + 1
-                            
-                            local source = DecompileScript(obj)
-                            local name = SafeName(obj.Name)
-                            local fullPath = obj:GetFullName()
-                            local parentPath = SafeName(obj.Parent and obj.Parent:GetFullName() or "Unknown")
-                            
-                            -- Determine type
-                            local folder = "ServerScripts"
-                            local ext = ".server.lua"
-                            local typeLabel = "Server"
-                            
-                            if obj:IsA("LocalScript") then
-                                folder = "LocalScripts"
-                                ext = ".client.lua"
-                                typeLabel = "Local"
-                                localCount = localCount + 1
-                            elseif obj:IsA("ModuleScript") then
-                                folder = "ModuleScripts"
-                                ext = ".module.lua"
-                                typeLabel = "Module"
-                                moduleCount = moduleCount + 1
-                            else
-                                serverCount = serverCount + 1
-                            end
-                            
-                            -- Header with full context
-                            local header = string.format(
-                                "-- ============================================================\n" ..
-                                "-- SCRIPT: %s\n" ..
-                                "-- TYPE: %s (%s)\n" ..
-                                "-- PATH: %s\n" ..
-                                "-- PARENT: %s [%s]\n" ..
-                                "-- SERVICE: %s\n" ..
-                                "-- ENABLED: %s\n" ..
-                                "-- ============================================================\n\n",
-                                obj.Name,
-                                typeLabel, obj.ClassName,
-                                fullPath,
-                                obj.Parent and obj.Parent.Name or "nil",
-                                obj.Parent and obj.Parent.ClassName or "nil",
-                                svcName,
-                                tostring(pcall(function() return obj.Enabled end) and (obj.Enabled ~= false) or "N/A")
-                            )
-                            
-                            -- Save individually by type
-                            local fileName = string.format("%04d", scriptCount) .. "_" .. name .. ext
-                            SafeWrite(ROOT .. "/" .. folder .. "/" .. fileName, header .. source)
-                            fileCount = fileCount + 1
-                            
-                            -- Also organize by parent folder
-                            local folderKey = SafeName(svcName .. "/" .. (obj.Parent and obj.Parent.Name or "root"))
-                            if not folderScripts[folderKey] then
-                                folderScripts[folderKey] = {}
-                            end
-                            table.insert(folderScripts[folderKey], {
-                                name = obj.Name,
-                                class = obj.ClassName,
-                                path = fullPath,
-                                source = source,
-                                header = header,
-                            })
-                            
-                            Log("[" .. typeLabel .. "] " .. obj.Name .. " ← " .. svcName)
-                            
-                            if scriptCount % 20 == 0 then
-                                UpdateProgress()
-                                task.wait()
-                            end
-                        end
-                        
-                        if scannedInstances % 300 == 0 then
-                            task.wait()
-                        end
-                    end
-                end)
-            end
-            
-            -- Save organized by folder
-            UpdateStatus("Saving by folder structure...")
-            for folderKey, scripts in pairs(folderScripts) do
-                local folderPath = ROOT .. "/ByFolder/" .. folderKey
-                MakeFolder(folderPath)
-                
-                for i, s in ipairs(scripts) do
-                    local ext = ".lua"
-                    if s.class == "LocalScript" then ext = ".client.lua"
-                    elseif s.class == "ModuleScript" then ext = ".module.lua"
-                    else ext = ".server.lua" end
-                    
-                    local fn = SafeName(s.name) .. "_" .. i .. ext
-                    SafeWrite(folderPath .. "/" .. fn, s.header .. s.source)
-                    fileCount = fileCount + 1
-                end
-            end
-            
-            -- Save combined file (all scripts in 1 file)
-            UpdateStatus("Saving combined file...")
-            local combined = string.format(
-                "-- ============================================================\n" ..
-                "-- ALL GAME SCRIPTS (Logic Only, No Assets)\n" ..
-                "-- Game: %s (ID: %d)\n" ..
-                "-- Total Scripts: %d (Local: %d, Server: %d, Module: %d)\n" ..
-                "-- Instances Scanned: %d\n" ..
-                "-- Date: %s\n" ..
-                "-- ============================================================\n\n",
-                gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
-                scannedInstances, os.date("%Y-%m-%d %H:%M:%S")
-            )
-            
-            for folderKey, scripts in pairs(folderScripts) do
-                combined = combined .. "\n\n" .. string.rep("=", 70) .. "\n"
-                combined = combined .. "-- FOLDER: " .. folderKey .. " (" .. #scripts .. " scripts)\n"
-                combined = combined .. string.rep("=", 70) .. "\n"
-                
-                for _, s in ipairs(scripts) do
-                    combined = combined .. "\n" .. s.header .. s.source .. "\n"
-                end
-                
-                -- Chunk if too large
-                if #combined > 800000 then
-                    SafeWrite(ROOT .. "/ALL_SCRIPTS_combined_part" .. fileCount .. ".lua", combined)
-                    fileCount = fileCount + 1
-                    combined = ""
-                end
-            end
-            if combined ~= "" then
-                SafeWrite(ROOT .. "/ALL_SCRIPTS_combined.lua", combined)
-                fileCount = fileCount + 1
-            end
-            
-            -- Save script index/map
-            local indexText = string.format(
-                "SCRIPTS ONLY DUMP - INDEX\n" ..
-                string.rep("=", 60) .. "\n" ..
-                "Game: %s (ID: %d)\n" ..
-                "Total Scripts: %d\n" ..
-                "  LocalScripts: %d\n" ..
-                "  ServerScripts: %d\n" ..
-                "  ModuleScripts: %d\n" ..
-                "Total Instances Scanned: %d\n" ..
-                "Date: %s\n\n" ..
-                string.rep("=", 60) .. "\n" ..
-                "FOLDER STRUCTURE:\n" ..
-                string.rep("=", 60) .. "\n\n",
-                gameName, gameId, scriptCount, localCount, serverCount, moduleCount,
-                scannedInstances, os.date("%Y-%m-%d %H:%M:%S")
-            )
-            
-            for folderKey, scripts in pairs(folderScripts) do
-                indexText = indexText .. "\n📁 " .. folderKey .. "/ (" .. #scripts .. " scripts)\n"
-                for i, s in ipairs(scripts) do
-                    indexText = indexText .. "  " .. i .. ". [" .. s.class .. "] " .. s.name .. "\n"
-                    indexText = indexText .. "     Path: " .. s.path .. "\n"
-                end
-            end
-            
-            indexText = indexText .. "\n\n" .. string.rep("=", 60) .. "\n"
-            indexText = indexText .. "OUTPUT LOCATION:\n"
-            indexText = indexText .. "  Delta: /sdcard/Delta/workspace/" .. ROOT .. "/\n"
-            indexText = indexText .. "  Fluxus: /sdcard/Fluxus/workspace/" .. ROOT .. "/\n"
-            indexText = indexText .. "\nFOLDER LAYOUT:\n"
-            indexText = indexText .. "  /LocalScripts/    - Client-side scripts\n"
-            indexText = indexText .. "  /ServerScripts/   - Server-side scripts\n"
-            indexText = indexText .. "  /ModuleScripts/   - Module scripts (shared logic)\n"
-            indexText = indexText .. "  /ByFolder/        - Scripts organized by parent folder\n"
-            indexText = indexText .. "  ALL_SCRIPTS_combined.lua - Semua script dalam 1 file\n"
-            
-            SafeWrite(ROOT .. "/INDEX.txt", indexText)
-            fileCount = fileCount + 1
-            
-            -- Done
-            Log("=== SCRIPTS DUMP COMPLETE ===")
-            Log(string.format("Found %d scripts (L:%d S:%d M:%d) from %d instances",
-                scriptCount, localCount, serverCount, moduleCount, scannedInstances))
-            Log("Saved to: workspace/" .. ROOT)
-            UpdateStatus("✅ DONE! " .. scriptCount .. " scripts → " .. fileCount .. " files")
-            
-            ScriptsDeepBtn.Text = "✅ " .. scriptCount .. " scripts extracted!"
+            local folder, count, files, rate = ScriptsOnlyDump()
+            ScriptsDeepBtn.Text = string.format("✅ %d scripts | %d%% decompiled!", count or 0, rate or 0)
             ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(30, 160, 30)
             task.wait(5)
-            ScriptsDeepBtn.Text = "📜 SCRIPTS ONLY (Logic Game, Skip Assets)"
-            ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 0)
-            DUMP_RUNNING = false
+            ScriptsDeepBtn.Text = "📜 SCRIPTS ONLY (Maximum Extraction)"
+            ScriptsDeepBtn.BackgroundColor3 = Color3.fromRGB(220, 100, 0)
         end)
     end)
     
     SaveInstanceBtn.MouseButton1Click:Connect(function()
-        if not saveinstance then
-            Log("❌ saveinstance not supported by this executor!")
+        if not (type(saveinstance) == "function") then
+            Log("❌ saveinstance not supported!")
             SaveInstanceBtn.Text = "❌ NOT SUPPORTED"
             task.wait(2)
-            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - If Supported"
+            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - Advanced Options"
             return
         end
         
-        SaveInstanceBtn.Text = "⏳ SAVING..."
+        SaveInstanceBtn.Text = "⏳ SAVING (Full Options)..."
         task.spawn(function()
             local gameName, gameId = GetGameInfo()
             local ok, err = pcall(function()
                 saveinstance({
                     FilePath = "MapRip/" .. gameName .. "_" .. gameId .. "_FULL.rbxlx",
-                    ExcludePlayerCharacter = true,
+                    Decompile = true,
+                    DecompileTimeout = 30,
                     NilInstances = true,
+                    RemovePlayerCharacters = true,
+                    ExcludePlayerCharacter = true,
+                    ExcludePlayerGui = false,
+                    IsolateStarterPlayer = false,
+                    ShowStatus = true,
+                    SaveBytecode = true,
+                    mode = "full",
                 })
             end)
             if ok then
-                SaveInstanceBtn.Text = "✅ SAVED .rbxlx!"
-                Log("Full .rbxlx saved successfully!")
+                SaveInstanceBtn.Text = "✅ SAVED .rbxlx (Full + Bytecode)!"
+                Log("Full .rbxlx saved with bytecode fallback!")
             else
                 SaveInstanceBtn.Text = "❌ Error: " .. tostring(err):sub(1, 40)
                 Log("saveinstance error: " .. tostring(err))
             end
             task.wait(3)
-            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - If Supported"
+            SaveInstanceBtn.Text = "💾 SAVE FULL MAP (.rbxlx) - Advanced Options"
         end)
     end)
     
     ClipboardBtn.MouseButton1Click:Connect(function()
-        ClipboardBtn.Text = "⏳ COLLECTING..."
+        ClipboardBtn.Text = "⏳ COLLECTING (All layers)..."
         task.spawn(function()
+            local allScripts = DiscoverAllScripts()
             local all = {}
             local count = 0
             
-            local function Grab(parent)
-                pcall(function()
-                    for _, obj in ipairs(parent:GetDescendants()) do
-                        if obj:IsA("BaseScript") or obj:IsA("ModuleScript") then
-                            count = count + 1
-                            local src = DecompileScript(obj)
-                            table.insert(all, "\n" .. string.rep("=", 60) .. "\n-- [" .. count .. "] " .. obj:GetFullName() .. "\n-- Class: " .. obj.ClassName .. "\n" .. string.rep("=", 60) .. "\n" .. src)
-                        end
-                    end
-                end)
+            for _, entry in ipairs(allScripts) do
+                local obj = entry.instance
+                count = count + 1
+                local decompResult = UltimateDecompile(obj)
+                all[#all+1] = "\n" .. string.rep("=", 60) .. "\n-- [" .. count .. "] " .. obj:GetFullName() .. "\n-- Class: " .. obj.ClassName .. "\n-- Method: " .. decompResult.method .. "\n" .. string.rep("=", 60) .. "\n" .. (decompResult.source or "-- EMPTY")
+                
+                if count % 5 == 0 then task.wait(0.1) end
             end
             
-            Grab(Workspace)
-            Grab(ReplicatedStorage)
-            Grab(ReplicatedFirst)
-            Grab(Lighting)
-            Grab(StarterGui)
-            Grab(StarterPack)
-            Grab(StarterPlayer)
-            Grab(SoundService)
-            pcall(function() Grab(LocalPlayer.PlayerGui) end)
-            pcall(function() Grab(LocalPlayer.PlayerScripts) end)
-            pcall(function() Grab(LocalPlayer.Backpack) end)
-            
-            local text = "-- TOTAL SCRIPTS: " .. count .. "\n" .. table.concat(all, "\n")
+            local text = "-- TOTAL SCRIPTS: " .. count .. "\n-- Extracted with ULTIMATE MAP RIPPER v4.0\n" .. table.concat(all, "\n")
             
             if setclipboard then
                 setclipboard(text)
@@ -1312,7 +2650,7 @@ local function CreateGUI()
             local function MapTree(inst, depth)
                 count = count + 1
                 local indent = string.rep("│ ", depth)
-                table.insert(lines, indent .. "├─ [" .. inst.ClassName .. "] " .. inst.Name)
+                lines[#lines+1] = indent .. "├─ [" .. inst.ClassName .. "] " .. inst.Name
                 pcall(function()
                     for _, child in ipairs(inst:GetChildren()) do
                         MapTree(child, depth + 1)
@@ -1321,11 +2659,11 @@ local function CreateGUI()
                 if count % 500 == 0 then task.wait() end
             end
             
-            local services = {Workspace, ReplicatedStorage, ReplicatedFirst, Lighting, StarterGui, StarterPack, StarterPlayer, SoundService}
-            local names = {"Workspace", "ReplicatedStorage", "ReplicatedFirst", "Lighting", "StarterGui", "StarterPack", "StarterPlayer", "SoundService"}
+            local svcList = {Workspace, ReplicatedStorage, ReplicatedFirst, Lighting, StarterGui, StarterPack, StarterPlayer, SoundService}
+            local svcNames = {"Workspace", "ReplicatedStorage", "ReplicatedFirst", "Lighting", "StarterGui", "StarterPack", "StarterPlayer", "SoundService"}
             
-            for i, svc in ipairs(services) do
-                table.insert(lines, "\n" .. string.rep("=", 50) .. "\n" .. names[i] .. "\n" .. string.rep("=", 50))
+            for i, svc in ipairs(svcList) do
+                lines[#lines+1] = "\n" .. string.rep("=", 50) .. "\n" .. svcNames[i] .. "\n" .. string.rep("=", 50)
                 pcall(function()
                     for _, child in ipairs(svc:GetChildren()) do
                         MapTree(child, 1)
@@ -1347,6 +2685,11 @@ local function CreateGUI()
     if not ok then Gui.Parent = LocalPlayer.PlayerGui end
     
     Log("GUI Ready! Game: " .. game.PlaceId)
+    Log("Executor APIs detected:")
+    Log("  decompile: " .. tostring(HAS_DECOMPILE))
+    Log("  getsenv: " .. tostring(HAS_GETSENV))
+    Log("  bytecode: " .. tostring(HAS_GETSCRIPTBYTECODE))
+    Log("  nil/running/gc: " .. tostring(HAS_GETNILINSTANCES) .. "/" .. tostring(HAS_GETRUNNINGSCRIPTS) .. "/" .. tostring(HAS_GETGC))
     return Gui
 end
 
